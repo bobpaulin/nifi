@@ -314,7 +314,7 @@ public class PythonProcess {
         // Check for python command.
         return List.of(virtualEnvDirectories)
                 .stream()
-                .filter(file -> ArrayUtils.isNotEmpty(file.list((dir, name) -> name.startsWith(pythonCmd))))
+                .filter(file -> ArrayUtils.isNotEmpty(file.list((dir, name) -> name.equals(pythonCmd) || name.equals(pythonCmd + ".exe"))))
                 .findFirst()
                 .orElseThrow(() -> new IOException("Failed to find Python command [%s]".formatted(pythonCmd)))
                 .getName();
