@@ -99,7 +99,7 @@ public class RedisContainer extends GenericContainer<RedisContainer> {
         adjustConfiguration();
 
         Path configurationFilePath = writeConfigurationFile().toAbsolutePath();
-        String containerPath = "/usr/local/etc/redis/redis.conf";
+        String containerPath = "/usr/local/etc/valkey/valkey.conf";
         withCopyToContainer(MountableFile.forHostPath(configurationFilePath), containerPath);
 
         setCommand(containerPath);
@@ -109,10 +109,10 @@ public class RedisContainer extends GenericContainer<RedisContainer> {
         try {
             Path mountDirectory = this.configurationMountDirectory;
             if (mountDirectory == null) {
-                mountDirectory = Files.createTempDirectory("redis-container-configuration");
+                mountDirectory = Files.createTempDirectory("valkey-container-configuration");
             }
 
-            Path configFile = mountDirectory.resolve("redis-" + UUID.randomUUID() + ".conf");
+            Path configFile = mountDirectory.resolve("valkey-" + UUID.randomUUID() + ".conf");
             Files.write(configFile, configurationOptions, StandardCharsets.UTF_8);
 
             return configFile;

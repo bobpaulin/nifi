@@ -56,7 +56,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class ITRedisStateProvider {
 
     protected final String componentId = "111111111-1111-1111-1111-111111111111";
-    public static RedisContainer redisContainer = new RedisContainer("redis:8.2.2-alpine").withExposedPorts(6379);
+    public static RedisContainer redisContainer = new RedisContainer("valkey/valkey:latest").withExposedPorts(6379);
 
     private RedisStateProvider provider;
 
@@ -379,7 +379,7 @@ public class ITRedisStateProvider {
 
     private static void flushDatabase() {
         try {
-            final Container.ExecResult execResult = redisContainer.execInContainer("redis-cli", "flushall");
+            final Container.ExecResult execResult = redisContainer.execInContainer("valkey-cli", "flushall");
             if (execResult.getExitCode() != 0) {
                 throw new IllegalStateException(String.format("Failed to flush Redis container: %s%s",
                         execResult.getStdout(), execResult.getStderr()));
