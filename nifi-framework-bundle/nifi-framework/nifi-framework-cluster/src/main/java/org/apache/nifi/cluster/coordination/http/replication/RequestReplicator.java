@@ -148,4 +148,12 @@ public interface RequestReplicator {
      *         no request exists with the given identifier
      */
     AsyncClusterResponse getClusterResponse(String requestIdentifier);
+
+    /**
+     * @return false when this node is not connected, a node is still connecting, or a node has not yet connected.
+     *         A replicated read would then omit a node that is about to join.
+     */
+    default boolean isMembershipSettled() {
+        return true;
+    }
 }

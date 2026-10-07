@@ -18,6 +18,7 @@ package org.apache.nifi.web.api;
 
 import jakarta.servlet.ServletContext;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.ws.rs.HttpMethod;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
@@ -32,6 +33,8 @@ import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.authorization.user.NiFiUserDetails;
 import org.apache.nifi.authorization.user.StandardNiFiUser;
+import org.apache.nifi.cluster.manager.ConnectorEntityMerger;
+import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.components.BacklogReportingException;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.util.NiFiProperties;
@@ -41,6 +44,7 @@ import org.apache.nifi.web.api.dto.AllowableValueDTO;
 import org.apache.nifi.web.api.dto.BacklogDTO;
 import org.apache.nifi.web.api.dto.ComponentStateDTO;
 import org.apache.nifi.web.api.dto.ConfigurationStepConfigurationDTO;
+import org.apache.nifi.web.api.dto.ConnectorActionDTO;
 import org.apache.nifi.web.api.dto.ConnectorDTO;
 import org.apache.nifi.web.api.dto.ConnectorValueReferenceDTO;
 import org.apache.nifi.web.api.dto.FlowSnippetDTO;
@@ -109,6 +113,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -534,6 +539,50 @@ public class TestConnectorResource {
 
         verify(serviceFacade).verifyUpdateConnector(any(ConnectorDTO.class));
         verify(serviceFacade).scheduleConnector(any(Revision.class), eq(CONNECTOR_ID), eq(ScheduledState.RUNNING));
+    }
+
+    @Test
+    public void testReplicatedStartRejectedWhenNodesLoadDifferentBundles() throws Exception {
+        final ConnectorActionDTO startAction = new ConnectorActionDTO();
+        startAction.setName("START");
+        startAction.setAllowed(false);
+        startAction.setReasonNotAllowed(ConnectorEntityMerger.LOADED_BUNDLE_MISMATCH_REASON + "{node-1:8443=org.apache.nifi:test-nar:1.0.0, node-2:8443=org.apache.nifi:test-nar:2.0.0}");
+        final ConnectorResource spyResource = createReplicatingResource(startAction);
+
+        final IllegalStateException exception = assertThrows(IllegalStateException.class,
+            () -> spyResource.updateRunStatus(CONNECTOR_ID, createConnectorRunStatusEntity()));
+
+        assertTrue(exception.getMessage().contains(ConnectorEntityMerger.LOADED_BUNDLE_MISMATCH_REASON));
+        verify(spyResource, never()).replicate(eq(HttpMethod.PUT), any(ConnectorRunStatusEntity.class));
+    }
+
+    @Test
+    public void testReplicatedStartProceedsWhenNodesLoadSameBundle() throws Exception {
+        final ConnectorActionDTO startAction = new ConnectorActionDTO();
+        startAction.setName("START");
+        startAction.setAllowed(true);
+        final ConnectorResource spyResource = createReplicatingResource(startAction);
+        doReturn(Response.ok().build()).when(spyResource).replicate(eq(HttpMethod.PUT), any(ConnectorRunStatusEntity.class));
+
+        try (Response response = spyResource.updateRunStatus(CONNECTOR_ID, createConnectorRunStatusEntity())) {
+            assertEquals(200, response.getStatus());
+        }
+
+        verify(spyResource).replicateNodeResponse(eq(new URI("http://localhost:8080/nifi-api/connectors/" + CONNECTOR_ID)), eq(HttpMethod.GET), any(), isNull());
+    }
+
+    private ConnectorResource createReplicatingResource(final ConnectorActionDTO startAction) throws Exception {
+        final ConnectorEntity mergedEntity = createConnectorEntity();
+        mergedEntity.getComponent().setAvailableActions(List.of(startAction));
+        final NodeResponse nodeResponse = mock(NodeResponse.class);
+        when(nodeResponse.getUpdatedEntity()).thenReturn(mergedEntity);
+        when(uriInfo.getAbsolutePath()).thenReturn(new URI("http://localhost:8080/nifi-api/connectors/" + CONNECTOR_ID + "/run-status"));
+
+        final ConnectorResource spyResource = spy(connectorResource);
+        doReturn(true).when(spyResource).isReplicateRequest();
+        doReturn(ApplicationResource.ReplicationTarget.CLUSTER_NODES).when(spyResource).getReplicationTarget();
+        doReturn(nodeResponse).when(spyResource).replicateNodeResponse(any(URI.class), eq(HttpMethod.GET), any(), isNull());
+        return spyResource;
     }
 
     @Test

@@ -152,6 +152,25 @@ public class JerseyConnectorClient extends AbstractJerseyClient implements Conne
     }
 
     @Override
+    public ConnectorEntity discardConnectorUpdate(final ConnectorEntity connectorEntity) throws NiFiClientException, IOException {
+        if (connectorEntity == null) {
+            throw new IllegalArgumentException("Connector entity cannot be null");
+        }
+
+        return executeAction("Error discarding Connector working configuration", () -> {
+            WebTarget target = connectorTarget
+                .path("working-configuration")
+                .queryParam("version", connectorEntity.getRevision().getVersion())
+                .queryParam("clientId", connectorEntity.getRevision().getClientId())
+                .resolveTemplate("id", connectorEntity.getId());
+            if (connectorEntity.isDisconnectedNodeAcknowledged()) {
+                target = target.queryParam("disconnectedNodeAcknowledged", "true");
+            }
+            return getRequestBuilder(target).delete(ConnectorEntity.class);
+        });
+    }
+
+    @Override
     public ConnectorEntity startConnector(final String connectorId, final String clientId, final long version) throws NiFiClientException, IOException {
         return updateConnectorRunStatus(connectorId, "RUNNING", clientId, version, false);
     }

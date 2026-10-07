@@ -326,4 +326,10 @@ public interface ConnectorRepository {
      */
     default void notifyMigrationComplete(final String connectorId, final String sourceProcessGroupId) {
     }
+
+    /**
+     * Shuts down repository-managed lifecycle resources.
+     */
+    default void shutdown() {
+    }
 }

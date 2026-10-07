@@ -21,8 +21,12 @@ import org.apache.nifi.asset.AssetManager;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.ConfigVerificationResult;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.connector.ConnectorTestSupport.Harness;
+import org.apache.nifi.components.connector.ConnectorTestSupport.RecordingConnector;
 import org.apache.nifi.components.connector.components.FlowContext;
 import org.apache.nifi.components.connector.components.FlowContextType;
+import org.apache.nifi.components.connector.components.ProcessGroupFacade;
+import org.apache.nifi.components.connector.components.ProcessGroupLifecycle;
 import org.apache.nifi.components.connector.secrets.SecretsManager;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
@@ -30,21 +34,28 @@ import org.apache.nifi.components.state.StateManagerProvider;
 import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.components.validation.ValidationState;
 import org.apache.nifi.components.validation.ValidationStatus;
+import org.apache.nifi.connectable.Position;
 import org.apache.nifi.controller.MockStateManagerProvider;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.queue.QueueSize;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.controller.state.StandardStateMap;
 import org.apache.nifi.engine.FlowEngine;
 import org.apache.nifi.flow.Bundle;
+import org.apache.nifi.flow.ExecutionEngine;
 import org.apache.nifi.flow.VersionedConfigurationStep;
 import org.apache.nifi.flow.VersionedConnectorValueReference;
 import org.apache.nifi.flow.VersionedExternalFlow;
+import org.apache.nifi.flow.VersionedProcessGroup;
+import org.apache.nifi.groups.FlowFileConcurrency;
+import org.apache.nifi.groups.FlowFileOutboundPolicy;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.migration.ConnectorPropertyConfiguration;
 import org.apache.nifi.nar.ExtensionManager;
 import org.apache.nifi.nar.InstanceClassLoader;
+import org.apache.nifi.security.encryption.PropertyEncryptionProvider;
 import org.apache.nifi.util.MockComponentLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +71,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -76,6 +88,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.apache.nifi.components.connector.ConnectorTestSupport.flowGroup;
+import static org.apache.nifi.components.connector.ConnectorTestSupport.harness;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -130,8 +144,23 @@ public class TestStandardConnectorNode {
 
         when(managedProcessGroup.purge()).thenReturn(CompletableFuture.completedFuture(null));
         when(managedProcessGroup.getQueueSize()).thenReturn(new QueueSize(0, 0L));
+        when(managedProcessGroup.getIdentifier()).thenReturn("managed-group");
+        when(managedProcessGroup.getProcessGroupIdentifier()).thenReturn("managed-group");
+        when(managedProcessGroup.getVersionedComponentId()).thenReturn(Optional.of("managed-group-versioned"));
+        when(managedProcessGroup.getName()).thenReturn("Managed Group");
+        when(managedProcessGroup.getPosition()).thenReturn(new Position(0, 0));
+        when(managedProcessGroup.getFlowFileConcurrency()).thenReturn(FlowFileConcurrency.UNBOUNDED);
+        when(managedProcessGroup.getFlowFileOutboundPolicy()).thenReturn(FlowFileOutboundPolicy.STREAM_WHEN_AVAILABLE);
+        when(managedProcessGroup.getExecutionEngine()).thenReturn(ExecutionEngine.INHERITED);
         when(managedProcessGroup.findAllProcessors()).thenReturn(List.of());
         when(managedProcessGroup.findAllControllerServices()).thenReturn(Set.of());
+        when(managedProcessGroup.getProcessors()).thenReturn(Set.of());
+        when(managedProcessGroup.getProcessGroups()).thenReturn(Set.of());
+        when(managedProcessGroup.getInputPorts()).thenReturn(Set.of());
+        when(managedProcessGroup.getOutputPorts()).thenReturn(Set.of());
+        when(managedProcessGroup.getRemoteProcessGroups()).thenReturn(Set.of());
+        when(managedProcessGroup.getControllerServices(false)).thenReturn(Set.of());
+        when(managedProcessGroup.getConnections()).thenReturn(Set.of());
 
         flowContextFactory = new FlowContextFactory() {
             @Override
@@ -139,6 +168,11 @@ public class TestStandardConnectorNode {
                 final MutableConnectorConfigurationContext activeConfigurationContext = new StandardConnectorConfigurationContext(assetManager, secretsManager);
                 final ProcessGroupFacadeFactory processGroupFacadeFactory = mock(ProcessGroupFacadeFactory.class);
                 final ParameterContextFacadeFactory parameterContextFacadeFactory = mock(ParameterContextFacadeFactory.class);
+                final ProcessGroupLifecycle lifecycle = mock(ProcessGroupLifecycle.class);
+                when(lifecycle.stop()).thenReturn(CompletableFuture.completedFuture(null));
+                final ProcessGroupFacade rootGroup = mock(ProcessGroupFacade.class);
+                when(rootGroup.getLifecycle()).thenReturn(lifecycle);
+                when(processGroupFacadeFactory.create(managedProcessGroup, connectorLogger)).thenReturn(rootGroup);
                 return new StandardFlowContext(managedProcessGroup, activeConfigurationContext, processGroupFacadeFactory,
                     parameterContextFacadeFactory, connectorLogger, FlowContextType.ACTIVE, bundle);
             }
@@ -1031,6 +1065,57 @@ public class TestStandardConnectorNode {
         assertEquals("1.0.0", connectorNode.getWorkingFlowContext().getBundle().getVersion());
         assertEquals("active-value", connectorNode.getActiveFlowContext().getConfigurationContext().getProperty("active-step", "property").getValue());
         assertEquals("working-value", connectorNode.getWorkingFlowContext().getConfigurationContext().getProperty("working-step", "property").getValue());
+    }
+
+
+    @Test
+    public void testFailedReplaceConnectorKeepsSnapshotAndPendingState() throws FlowUpdateException {
+        final StandardConnectorNode connectorNode = createConnectorNode(new TrackingConnector());
+        connectorNode.setConfiguration("step", createStepConfiguration());
+        connectorNode.adoptAuthoritativeSnapshot(flowGroup("outgoing"), null, new Bundle("org.apache.nifi", "test-standard-connector-node", "1.0.0"));
+        final ConnectorFlowSnapshot originalSnapshot = connectorNode.getAuthoritativeFlowSnapshot();
+        final FailingStepConnector replacement = new FailingStepConnector("step");
+        replacement.setFailOnStep(true);
+
+        assertThrows(FlowUpdateException.class, () -> replaceConnector(connectorNode, replacement, "2.0.0"));
+
+        assertSame(originalSnapshot, connectorNode.getAuthoritativeFlowSnapshot());
+        assertFalse(connectorNode.isPendingFlowEvolution());
+        assertEquals("1.0.0", connectorNode.getBundleCoordinate().getVersion());
+    }
+
+
+    @Test
+    public void testManagedFlowMissingAtStartupRejectsStartAfterBecomingLoadable() throws FlowUpdateException {
+        final StandardConnectorNode connectorNode = createConnectorNode(new TrackingConnector());
+        connectorNode.adoptAuthoritativeSnapshot(flowGroup("outgoing"), null, new Bundle("org.apache.nifi", "test-standard-connector-node", "1.0.0"));
+        final GhostConnector ghostConnector = new GhostConnector(connectorNode.getIdentifier(), connectorNode.getCanonicalClassName(), new Exception("Instantiation failed"));
+        replaceConnector(connectorNode, ghostConnector, "2.0.0");
+        connectorNode.markManagedFlowMissingAtStartup();
+
+        replaceConnector(connectorNode, new TrackingConnector(), "2.0.0");
+        connectorNode.performValidation();
+
+        assertFalse(connectorNode.isExtensionMissing());
+        assertTrue(connectorNode.isManagedFlowMissingAtStartup());
+        final ConnectorAction start = findAction(connectorNode, "START");
+        assertFalse(start.isAllowed());
+        assertTrue(start.getReasonNotAllowed().contains("restart NiFi"), start.getReasonNotAllowed());
+        final IllegalStateException failure = assertThrows(IllegalStateException.class, connectorNode::verifyCanStart);
+        assertTrue(failure.getMessage().contains("restart NiFi"), failure.getMessage());
+    }
+
+
+    private void replaceConnector(final StandardConnectorNode connectorNode, final Connector replacement, final String version) throws FlowUpdateException {
+        final BundleCoordinate replacementCoordinate = new BundleCoordinate("org.apache.nifi", "test-standard-connector-node", version);
+        connectorNode.replaceConnector(replacement, replacementCoordinate, new MockComponentLog("ReplacementConnector", replacement));
+    }
+
+    private static ConnectorAction findAction(final StandardConnectorNode connectorNode, final String actionName) {
+        return connectorNode.getAvailableActions().stream()
+            .filter(action -> actionName.equals(action.getName()))
+            .findFirst()
+            .orElseThrow();
     }
 
     @Test
@@ -2039,6 +2124,238 @@ public class TestStandardConnectorNode {
         connectorNode.verifyCanStart();
     }
 
+
+    @Test
+    public void testCancellationBeforeFuturePublicationCancelsReturnedFuture() throws Exception {
+        final RecordingConnector connector = new RecordingConnector();
+        connector.block = true;
+        connector.ignoreHookInterrupt = true;
+        connector.incompleteEvolutionFuture = true;
+        final Harness harness = harness(connector, false);
+        final FlowEngine flowEvolutionScheduler = new FlowEngine(2, "future-publication-test");
+
+        try {
+            final Future<Void> evolution = flowEvolutionScheduler.submit(() -> {
+                harness.node.runFlowEvolutionHook(flowEvolutionScheduler, Duration.ofSeconds(5));
+                return null;
+            });
+            assertTrue(connector.started.await(5, TimeUnit.SECONDS));
+
+            harness.node.cancelDrainFlowFiles();
+            connector.hookReleased.countDown();
+
+            assertTrue(connector.evolutionFuturePublished.await(5, TimeUnit.SECONDS));
+            final long cancellationDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!connector.evolutionFuture.isCancelled() && System.nanoTime() < cancellationDeadline) {
+                Thread.sleep(10L);
+            }
+            assertTrue(connector.evolutionFuture.isCancelled());
+            assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+            assertEvolutionContextClosed(connector.context);
+        } finally {
+            connector.hookReleased.countDown();
+            flowEvolutionScheduler.shutdown();
+        }
+    }
+
+
+    @Test
+    public void testAbortFlowEvolutionIsNotOverwrittenByLateCancellationFailure() throws Exception {
+        final RecordingConnector connector = new RecordingConnector();
+        connector.block = true;
+        final Harness harness = harness(connector, false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final CompletableFuture<Void> stopFuture = new CompletableFuture<>();
+        final CountDownLatch stopInvoked = new CountDownLatch(1);
+        when(harness.lifecycle.stop()).thenAnswer(invocation -> {
+            stopInvoked.countDown();
+            return stopFuture;
+        });
+        final FlowEngine flowEvolutionScheduler = new FlowEngine(2, "late-cancellation-test");
+
+        try {
+            final Future<Void> evolution = flowEvolutionScheduler.submit(() -> {
+                harness.node.runFlowEvolutionHook(flowEvolutionScheduler, Duration.ofSeconds(5));
+                return null;
+            });
+            assertTrue(connector.started.await(5, TimeUnit.SECONDS));
+
+            harness.node.cancelDrainFlowFiles();
+            assertTrue(stopInvoked.await(5, TimeUnit.SECONDS));
+            harness.node.abortFlowEvolution("Expected cluster participant disconnected");
+            stopFuture.complete(null);
+
+            assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+            assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+            assertEquals(FlowEvolutionStatus.FAILED, harness.node.getFlowEvolutionStatus());
+            assertTrue(harness.node.isPendingFlowEvolution());
+        } finally {
+            stopFuture.complete(null);
+            flowEvolutionScheduler.shutdown();
+        }
+    }
+
+
+    @Test
+    public void testApplyEvolvedFlowKeepsOutgoingSnapshotUntilCommit() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final Bundle outgoingBundle = new Bundle("org.apache.nifi", "test-nar", "1.0.0");
+        final StepConfiguration outgoingConfiguration = new StepConfiguration(Map.of("Comment", new StringLiteralValue("outgoing")));
+        final StepConfiguration incomingConfiguration = new StepConfiguration(Map.of("Comment", new StringLiteralValue("incoming")));
+        harness.node.getActiveFlowContext().getConfigurationContext().replaceProperties("Upgrade", outgoingConfiguration);
+        harness.node.getWorkingFlowContext().getConfigurationContext().replaceProperties("Upgrade", incomingConfiguration);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, outgoingBundle);
+        harness.node.beginFlowEvolution();
+
+        harness.node.applyEvolvedFlow();
+
+        assertEquals("2.0.0", harness.node.getActiveFlowContext().getBundle().getVersion());
+        assertEquals("1.0.0", harness.node.getAuthoritativeFlowSnapshot().bundle().getVersion());
+        assertEquals(outgoingConfiguration, harness.node.getAuthoritativeFlowSnapshot().activeConfiguration()
+                .getNamedStepConfiguration("Upgrade").configuration());
+
+        harness.node.authorizeFlowEvolutionCommit();
+        assertEquals("1.0.0", harness.node.getAuthoritativeFlowSnapshot().bundle().getVersion());
+        harness.node.commitEvolvedFlow();
+        assertEquals("2.0.0", harness.node.getAuthoritativeFlowSnapshot().bundle().getVersion());
+        assertEquals(incomingConfiguration, harness.node.getAuthoritativeFlowSnapshot().activeConfiguration()
+                .getNamedStepConfiguration("Upgrade").configuration());
+    }
+
+    @Test
+    public void testCommitEvolvedFlowPromotesSnapshotBeforePersistence() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        harness.node.beginFlowEvolution();
+
+        harness.node.applyEvolvedFlow();
+        assertTrue(harness.node.isPendingFlowEvolution());
+        harness.node.authorizeFlowEvolutionCommit();
+        assertTrue(harness.node.isPendingFlowEvolution());
+        harness.node.commitEvolvedFlow();
+        assertFalse(harness.node.isPendingFlowEvolution());
+        harness.node.markFlowEvolutionPersisted();
+        harness.node.completeEvolvedFlowCommit();
+        assertEquals(ConnectorState.RUNNING, harness.node.getDesiredState());
+    }
+
+    @Test
+    public void testStopBeforeCommitAuthorizationAbortsFlowEvolution() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        harness.node.claimFlowEvolution(new CompletableFuture<>());
+        assertEquals(ConnectorState.RUNNING, harness.node.getDesiredState());
+        harness.node.applyEvolvedFlow();
+
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+
+        harness.node.abortFlowEvolution("Flow evolution was cancelled");
+        stop.get(5, TimeUnit.SECONDS);
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(FlowEvolutionStatus.FAILED, harness.node.getFlowEvolutionStatus());
+        assertTrue(harness.node.isPendingFlowEvolution());
+    }
+
+    @Test
+    public void testStopAfterCommitAuthorizationDefersAndSkipsStart() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        harness.node.claimFlowEvolution(new CompletableFuture<>());
+        harness.node.applyEvolvedFlow();
+        harness.node.authorizeFlowEvolutionCommit();
+
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+
+        assertFalse(stop.isDone());
+        assertEquals(ConnectorState.DRAINING, harness.node.getCurrentState());
+        assertEquals(FlowEvolutionStatus.COMMIT_AUTHORIZED, harness.node.getFlowEvolutionStatus());
+        harness.node.commitEvolvedFlow();
+        harness.node.markFlowEvolutionPersisted();
+        assertFalse(harness.node.completeEvolvedFlowCommit());
+        stop.get(5, TimeUnit.SECONDS);
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(ConnectorState.STOPPED, harness.node.getDesiredState());
+        assertFalse(harness.node.isPendingFlowEvolution());
+    }
+
+
+    @Test
+    public void testCaptureAuthoritativeSnapshotRequiresPropertyEncryptionProvider() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final VersionedProcessGroup snapshot = flowGroup("existing");
+        harness.node.adoptAuthoritativeSnapshot(snapshot, null, new Bundle("org.apache.nifi", "test-nar", "2.0.0"));
+        when(harness.flowManager.getPropertyEncryptionProvider()).thenReturn(null);
+
+        final IllegalStateException failure = assertThrows(IllegalStateException.class, harness.node::captureAuthoritativeSnapshot);
+
+        assertTrue(failure.getMessage().contains("Property Encryption Provider"));
+        assertSame(snapshot, harness.node.getAuthoritativeManagedProcessGroup());
+    }
+
+
+    @Test
+    public void testPreUpgradeFlowContextUsesSnapshotBundleAndRejectsFlowUpdate() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final Bundle outgoingBundle = new Bundle("org.apache.nifi", "test-nar", "1.0.0");
+        final FlowContext preUpgrade = new PreUpgradeFlowContext(harness.node.getActiveFlowContext(), outgoingBundle);
+
+        assertEquals("2.0.0", harness.node.getActiveFlowContext().getBundle().getVersion());
+        assertEquals("2.0.0", harness.node.getWorkingFlowContext().getBundle().getVersion());
+        assertEquals("1.0.0", preUpgrade.getBundle().getVersion());
+        assertSame(harness.node.getActiveFlowContext().getRootGroup(), preUpgrade.getRootGroup());
+        assertSame(harness.node.getActiveFlowContext().getConfigurationContext(), preUpgrade.getConfigurationContext());
+        assertSame(harness.node.getActiveFlowContext().getParameterContext(), preUpgrade.getParameterContext());
+        assertEquals(harness.node.getActiveFlowContext().getType(), preUpgrade.getType());
+
+        final StandardConnectorInitializationContext initializationContext = new StandardConnectorInitializationContext.Builder()
+            .identifier("connector-1")
+            .name("RecordingConnector")
+            .build();
+        final IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+            () -> initializationContext.updateFlow(preUpgrade, new VersionedExternalFlow(), BundleCompatibility.REQUIRE_EXACT_BUNDLE));
+        assertTrue(rejected.getMessage().contains("not an instance provided by the framework"));
+    }
+
+    @Test
+    public void testCaptureAuthoritativeSnapshotRejectedWhilePending() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+
+        final IllegalStateException rejected = assertThrows(IllegalStateException.class, harness.node::captureAuthoritativeSnapshot);
+
+        assertTrue(rejected.getMessage().contains("pending"));
+        assertEquals("1.0.0", harness.node.getAuthoritativeFlowSnapshot().bundle().getVersion());
+        assertTrue(harness.node.isPendingFlowEvolution());
+    }
+
+
+    private static VersionedConfigurationStep versionedStep(final String name, final Map<String, String> properties) {
+        final Map<String, VersionedConnectorValueReference> references = new LinkedHashMap<>();
+        for (final Map.Entry<String, String> property : properties.entrySet()) {
+            final VersionedConnectorValueReference reference = new VersionedConnectorValueReference();
+            reference.setValueType("STRING_LITERAL");
+            reference.setValue(property.getValue());
+            references.put(property.getKey(), reference);
+        }
+        final VersionedConfigurationStep step = new VersionedConfigurationStep();
+        step.setName(name);
+        step.setProperties(references);
+        return step;
+    }
+
+    @Test
+    public void testEnterTroubleshootingKeepsExistingSnapshot() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final VersionedProcessGroup snapshot = flowGroup("held");
+        harness.node.adoptAuthoritativeSnapshot(snapshot, null, new Bundle("org.apache.nifi", "test-nar", "2.0.0"));
+
+        harness.node.enterTroubleshooting();
+
+        assertSame(snapshot, harness.node.getAuthoritativeManagedProcessGroup());
+        assertEquals(ConnectorState.TROUBLESHOOTING, harness.node.getCurrentState());
+    }
+
+
     private static Bundle createConnectorBundle() {
         final Bundle bundle = new Bundle();
         bundle.setGroup("org.apache.nifi");
@@ -2139,9 +2456,12 @@ public class TestStandardConnectorNode {
     private StandardConnectorNode createConnectorNode(final Connector connector, final SecretsManager initializedSecretsManager,
             final ConnectorStateTransition stateTransition) throws FlowUpdateException {
         final ConnectorValidationTrigger validationTrigger = new SynchronousConnectorValidationTrigger();
+        final FlowManager flowManager = mock(FlowManager.class);
+        when(flowManager.getPropertyEncryptionProvider()).thenReturn(mock(PropertyEncryptionProvider.class));
+        when(flowManager.getControllerServiceProvider()).thenReturn(mock(ControllerServiceProvider.class));
         final StandardConnectorNode node = new StandardConnectorNode(
             "test-connector-id",
-            mock(FlowManager.class),
+            flowManager,
             extensionManager,
             stateManagerProvider,
             null,
@@ -2969,6 +3289,72 @@ public class TestStandardConnectorNode {
         }
     }
 
+    private static class ProviderMigrationConnector extends AbstractConnector {
+        private final Set<String> configuredStepNames = new HashSet<>();
+
+        @Override
+        public VersionedExternalFlow getInitialFlow() {
+            return null;
+        }
+
+        @Override
+        public VersionedExternalFlow getActiveFlow(final FlowContext activeFlowContext) {
+            return null;
+        }
+
+        @Override
+        public void prepareForUpdate(final FlowContext workingContext, final FlowContext activeContext) {
+        }
+
+        @Override
+        public void migrateProperties(final ConnectorPropertyConfiguration configuration) {
+            configuration.forStep("settings").renameProperty("Old Name", "Shared");
+            configuration.removeStep("obsolete");
+        }
+
+        @Override
+        public List<ConfigurationStep> getConfigurationSteps() {
+            final ConnectorPropertyDescriptor shared = new ConnectorPropertyDescriptor.Builder()
+                .name("Shared")
+                .description("Shared property")
+                .required(false)
+                .build();
+            final ConnectorPropertyDescriptor requiredDefault = new ConnectorPropertyDescriptor.Builder()
+                .name("Required Default")
+                .description("Required property added by this version")
+                .required(true)
+                .defaultValue("v2")
+                .build();
+            final ConfigurationStep settings = new ConfigurationStep.Builder()
+                .name("settings")
+                .propertyGroups(List.of(ConnectorPropertyGroup.builder()
+                    .name("General")
+                    .description("General")
+                    .properties(List.of(shared, requiredDefault))
+                    .build()))
+                .build();
+            return List.of(settings);
+        }
+
+        @Override
+        public void applyUpdate(final FlowContext workingContext, final FlowContext activeContext) {
+        }
+
+        @Override
+        protected void onStepConfigured(final String stepName, final FlowContext workingContext) {
+            configuredStepNames.add(stepName);
+        }
+
+        @Override
+        public List<ConfigVerificationResult> verifyConfigurationStep(final String stepName, final Map<String, String> overrides, final FlowContext flowContext) {
+            return List.of();
+        }
+
+        Set<String> getConfiguredStepNames() {
+            return configuredStepNames;
+        }
+    }
+
     private static class LegacyStepRemovingConnector extends AbstractConnector {
         private final Set<String> configuredStepNames = new HashSet<>();
         private final Set<ClassLoader> migrationClassLoaders = new HashSet<>();
@@ -3206,6 +3592,13 @@ public class TestStandardConnectorNode {
         public boolean wasStoppedWhileStarting() {
             return stoppedWhileStarting;
         }
+    }
+
+    private static void assertEvolutionContextClosed(final FlowEvolutionContext context) {
+        final IllegalStateException preUpgradeFailure = assertThrows(IllegalStateException.class, context::getPreUpgradeActiveFlowContext);
+        assertTrue(preUpgradeFailure.getMessage().contains("can no longer be used"));
+        final IllegalStateException postUpgradeFailure = assertThrows(IllegalStateException.class, context::getPostUpgradeBundle);
+        assertTrue(postUpgradeFailure.getMessage().contains("can no longer be used"));
     }
 
     /**

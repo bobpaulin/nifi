@@ -40,6 +40,7 @@ import org.apache.nifi.cluster.coordination.http.endpoints.ProcessGroupEndpointM
 import org.apache.nifi.cluster.coordination.http.endpoints.ProcessorEndpointMerger;
 import org.apache.nifi.cluster.coordination.http.endpoints.RemoteProcessGroupEndpointMerger;
 import org.apache.nifi.cluster.coordination.http.endpoints.ReportingTaskEndpointMerger;
+import org.apache.nifi.cluster.coordination.node.DisconnectionCode;
 import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
 import org.apache.nifi.cluster.coordination.node.NodeConnectionStatus;
 import org.apache.nifi.cluster.manager.NodeResponse;
@@ -168,6 +169,24 @@ public class ThreadPoolRequestReplicator implements RequestReplicator, Closeable
     public void shutdown() {
         executorService.shutdown();
         maintenanceExecutor.shutdown();
+    }
+
+    @Override
+    public boolean isMembershipSettled() {
+        if (!clusterCoordinator.isConnected()) {
+            return false;
+        }
+
+        for (final NodeConnectionStatus status : clusterCoordinator.getConnectionStatuses()) {
+            if (status.getState() == NodeConnectionState.CONNECTING) {
+                return false;
+            }
+            if (status.getState() == NodeConnectionState.DISCONNECTED && status.getDisconnectCode() == DisconnectionCode.NOT_YET_CONNECTED) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     @Override

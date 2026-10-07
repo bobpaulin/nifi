@@ -16,11 +16,16 @@
  */
 package org.apache.nifi.web.api.dto;
 
+import org.apache.nifi.web.api.entity.BulletinEntity;
+import org.apache.nifi.web.api.entity.ConnectorEntity;
 import org.apache.nifi.web.api.entity.ProcessGroupEntity;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 public class EntityFactoryTest {
 
@@ -54,5 +59,30 @@ public class EntityFactoryTest {
 
         assertEquals("STANDARD", entity.getResolvedExecutionEngine());
         assertEquals(dto, entity.getComponent());
+    }
+
+    @Test
+    void testCreateConnectorEntityIncludesBulletinsWhenAuthorized() {
+        final ConnectorDTO dto = new ConnectorDTO();
+        dto.setId("connector-1");
+        final PermissionsDTO permissions = new PermissionsDTO();
+        permissions.setCanRead(true);
+        final List<BulletinEntity> bulletins = List.of(new BulletinEntity());
+
+        final ConnectorEntity entity = new EntityFactory().createConnectorEntity(dto, null, permissions, null, null, bulletins);
+
+        assertSame(bulletins, entity.getBulletins());
+    }
+
+    @Test
+    void testCreateConnectorEntityExcludesBulletinsWhenUnauthorized() {
+        final ConnectorDTO dto = new ConnectorDTO();
+        dto.setId("connector-1");
+        final PermissionsDTO permissions = new PermissionsDTO();
+        permissions.setCanRead(false);
+
+        final ConnectorEntity entity = new EntityFactory().createConnectorEntity(dto, null, permissions, null, null, List.of(new BulletinEntity()));
+
+        assertNull(entity.getBulletins());
     }
 }

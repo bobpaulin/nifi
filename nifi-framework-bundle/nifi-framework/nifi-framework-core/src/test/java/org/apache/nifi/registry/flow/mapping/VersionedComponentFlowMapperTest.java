@@ -21,6 +21,15 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.resource.ComponentAuthorizable;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.connector.ConnectorConfiguration;
+import org.apache.nifi.components.connector.ConnectorFlowSnapshot;
+import org.apache.nifi.components.connector.ConnectorNode;
+import org.apache.nifi.components.connector.ConnectorState;
+import org.apache.nifi.components.connector.FrameworkFlowContext;
+import org.apache.nifi.components.connector.MutableConnectorConfigurationContext;
+import org.apache.nifi.components.connector.NamedStepConfiguration;
+import org.apache.nifi.components.connector.StepConfiguration;
+import org.apache.nifi.components.connector.StringLiteralValue;
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.connectable.ConnectableType;
 import org.apache.nifi.connectable.Connection;
@@ -44,12 +53,14 @@ import org.apache.nifi.controller.queue.LoadBalanceCompression;
 import org.apache.nifi.controller.queue.LoadBalanceStrategy;
 import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceProvider;
+import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.ComponentType;
 import org.apache.nifi.flow.ExecutionEngine;
 import org.apache.nifi.flow.ExternalControllerServiceReference;
 import org.apache.nifi.flow.ParameterProviderReference;
 import org.apache.nifi.flow.PortType;
 import org.apache.nifi.flow.VersionedConnection;
+import org.apache.nifi.flow.VersionedConnector;
 import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedFlowCoordinates;
 import org.apache.nifi.flow.VersionedFunnel;
@@ -353,6 +364,109 @@ public class VersionedComponentFlowMapperTest {
         assertNotNull(externalControllerServiceReference);
         assertEquals(expectedExternalControllerServiceReferenceKey, externalControllerServiceReference.getIdentifier());
         assertEquals(externalControllerServiceNode.getName(), externalControllerServiceReference.getName());
+    }
+
+    @Test
+    public void testMapConnectorWritesAuthoritativeSnapshotOutsideTroubleshooting() {
+        final VersionedProcessGroup snapshot = new VersionedProcessGroup();
+        snapshot.setName("authoritative");
+        final VersionedConnector mapped = mapConnector(ConnectorState.STOPPED, snapshot, liveGroup("live"));
+
+        assertEquals("org.apache.nifi", mapped.getBundle().getGroup());
+        assertEquals("incoming-nar", mapped.getBundle().getArtifact());
+        assertEquals("2.0.0", mapped.getBundle().getVersion());
+        assertEquals("outgoing-nar", mapped.getManagedFlowBundle().getArtifact());
+        assertEquals("1.0.0", mapped.getManagedFlowBundle().getVersion());
+        assertEquals("authoritative", mapped.getManagedProcessGroup().getName());
+    }
+
+    @Test
+    public void testMapConnectorWritesLiveGroupWhileTroubleshooting() {
+        final VersionedProcessGroup snapshot = new VersionedProcessGroup();
+        snapshot.setName("authoritative");
+        final VersionedConnector mapped = mapConnector(ConnectorState.TROUBLESHOOTING, snapshot, liveGroup("edited"));
+
+        assertEquals("edited", mapped.getManagedProcessGroup().getName());
+        assertEquals("2.0.0", mapped.getBundle().getVersion());
+        assertEquals("1.0.0", mapped.getManagedFlowBundle().getVersion());
+    }
+
+    @Test
+    public void testMapConnectorWritesAtomicAuthoritativeSnapshot() {
+        final VersionedProcessGroup managedFlow = new VersionedProcessGroup();
+        managedFlow.setName("authoritative");
+        final VersionedParameterContext parameterContext = new VersionedParameterContext();
+        parameterContext.setName("authoritative-parameters");
+        final Bundle snapshotBundle = new Bundle("org.apache.nifi", "outgoing-nar", "1.0.0");
+        final StepConfiguration stepConfiguration = new StepConfiguration(Map.of("Comment", new StringLiteralValue("snapshot-value")));
+        final ConnectorConfiguration activeConfiguration = new ConnectorConfiguration(
+                Set.of(new NamedStepConfiguration("Upgrade", stepConfiguration)));
+        final ConnectorFlowSnapshot snapshot = new ConnectorFlowSnapshot(
+                managedFlow, parameterContext, snapshotBundle, activeConfiguration);
+
+        final VersionedConnector mapped = mapConnectorSnapshot(ConnectorState.STOPPED, snapshot, liveGroup("live"));
+
+        assertEquals(managedFlow, mapped.getManagedProcessGroup());
+        assertEquals(parameterContext, mapped.getManagedParameterContext());
+        assertEquals("incoming-nar", mapped.getBundle().getArtifact());
+        assertEquals("2.0.0", mapped.getBundle().getVersion());
+        assertEquals(snapshotBundle, mapped.getManagedFlowBundle());
+        assertEquals("snapshot-value", mapped.getActiveFlowConfiguration().getFirst().getProperties().get("Comment").getValue());
+    }
+
+    @Test
+    public void testMapConnectorWritesLiveGroupWhenSnapshotIsAbsentDuringTroubleshooting() {
+        final VersionedConnector mapped = mapConnector(ConnectorState.TROUBLESHOOTING, null, liveGroup("edited"));
+
+        assertEquals("edited", mapped.getManagedProcessGroup().getName());
+        assertNull(mapped.getManagedFlowBundle());
+    }
+
+    @Test
+    public void testMapConnectorOmitsManagedFlowWhenNoSnapshotExists() {
+        final VersionedConnector mapped = mapConnector(ConnectorState.STOPPED, null, liveGroup("live"));
+
+        assertNull(mapped.getManagedProcessGroup());
+    }
+
+    private VersionedConnector mapConnector(final ConnectorState state, final VersionedProcessGroup snapshot, final ProcessGroup liveGroup) {
+        final Bundle activeBundle = new Bundle("org.apache.nifi", "outgoing-nar", "1.0.0");
+        final ConnectorFlowSnapshot authoritativeSnapshot = snapshot == null ? null
+                : new ConnectorFlowSnapshot(snapshot, null, activeBundle, new ConnectorConfiguration(Set.of()));
+        return mapConnectorSnapshot(state, authoritativeSnapshot, liveGroup);
+    }
+
+    private VersionedConnector mapConnectorSnapshot(final ConnectorState state, final ConnectorFlowSnapshot authoritativeSnapshot,
+            final ProcessGroup liveGroup) {
+        final Bundle activeBundle = new Bundle("org.apache.nifi", "incoming-nar", "2.0.0");
+        final MutableConnectorConfigurationContext configurationContext = mock(MutableConnectorConfigurationContext.class);
+        when(configurationContext.toConnectorConfiguration()).thenReturn(new ConnectorConfiguration(Set.of()));
+        final FrameworkFlowContext activeContext = mock(FrameworkFlowContext.class);
+        when(activeContext.getBundle()).thenReturn(activeBundle);
+        when(activeContext.getConfigurationContext()).thenReturn(configurationContext);
+        when(activeContext.getManagedProcessGroup()).thenReturn(liveGroup);
+
+        final ConnectorNode connectorNode = mock(ConnectorNode.class);
+        when(connectorNode.getIdentifier()).thenReturn("connector-1");
+        when(connectorNode.getName()).thenReturn("Connector");
+        when(connectorNode.getCanonicalClassName()).thenReturn("org.apache.nifi.test.Connector");
+        when(connectorNode.getDesiredState()).thenReturn(state);
+        when(connectorNode.getCurrentState()).thenReturn(state);
+        when(connectorNode.getActiveFlowContext()).thenReturn(activeContext);
+        when(connectorNode.getWorkingFlowContext()).thenReturn(activeContext);
+        if (authoritativeSnapshot != null) {
+            when(connectorNode.getAuthoritativeFlowSnapshot()).thenReturn(authoritativeSnapshot);
+        }
+        when(connectorNode.getBundleCoordinate()).thenReturn(new BundleCoordinate("org.apache.nifi", "incoming-nar", "2.0.0"));
+
+        return flowMapper.mapConnector(connectorNode, controllerServiceProvider);
+    }
+
+    private ProcessGroup liveGroup(final String name) {
+        final ProcessGroup group = prepareProcessGroup(0, false, false, false, false, null, false, false, Collections.emptyList());
+        when(group.getName()).thenReturn(name);
+        when(group.findAllProcessGroups()).thenReturn(Collections.emptyList());
+        return group;
     }
 
     private ProcessGroup prepareProcessGroupWithParameterContext(final List<ProcessGroup> childProcessGroups,

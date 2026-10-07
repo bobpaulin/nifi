@@ -24,6 +24,11 @@ import org.apache.nifi.flow.VersionedParameter;
 import org.apache.nifi.flow.VersionedParameterContext;
 import org.apache.nifi.parameter.Parameter;
 import org.apache.nifi.parameter.ParameterLookup;
+import org.apache.nifi.security.encryption.PropertyEncryptionEncoder;
+import org.apache.nifi.security.encryption.PropertyEncryptionProvider;
+import org.apache.nifi.security.encryption.SensitivePropertyCodec;
+import org.apache.nifi.security.encryption.SensitivePropertyContext;
+import org.apache.nifi.security.encryption.SensitivePropertyContextFactory;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -39,11 +44,18 @@ public class ConnectorParameterLookup implements ParameterLookup {
     private final Map<String, Parameter> parameters;
     private final List<ParameterValue> parameterValues;
     private final AssetManager assetManager;
+    private final PropertyEncryptionProvider propertyEncryptionProvider;
 
     // TODO: Refactor how parameters work
     //       It is possible that a VersionedProcessGroup has a child where different parameter contexts are used or are used in a different inheritance order.
     public ConnectorParameterLookup(final Collection<VersionedParameterContext> parameterContexts, final AssetManager assetManager) {
+        this(parameterContexts, assetManager, null);
+    }
+
+    public ConnectorParameterLookup(final Collection<VersionedParameterContext> parameterContexts, final AssetManager assetManager,
+            final PropertyEncryptionProvider propertyEncryptionProvider) {
         this.assetManager = assetManager;
+        this.propertyEncryptionProvider = propertyEncryptionProvider;
 
         parameterValues = Collections.unmodifiableList(createParameterValues(parameterContexts));
         parameters = new HashMap<>();
@@ -173,9 +185,10 @@ public class ConnectorParameterLookup implements ParameterLookup {
                 }
 
                 final List<VersionedAsset> referencedAssets = versionedParameter.getReferencedAssets();
+                final String value = decryptParameterValue(context, versionedParameter);
                 final ParameterValue.Builder builder = new ParameterValue.Builder()
                     .name(parameterName)
-                    .value(referencedAssets == null || referencedAssets.isEmpty() ? versionedParameter.getValue() : null)
+                    .value(referencedAssets == null || referencedAssets.isEmpty() ? value : null)
                     .sensitive(versionedParameter.isSensitive());
 
                 if (assetManager != null && referencedAssets != null) {
@@ -189,6 +202,17 @@ public class ConnectorParameterLookup implements ParameterLookup {
                 parameterValues.add(parameterValue);
             }
         }
+    }
+
+    private String decryptParameterValue(final VersionedParameterContext context, final VersionedParameter parameter) {
+        final String value = parameter.getValue();
+        if (!parameter.isSensitive() || propertyEncryptionProvider == null || !PropertyEncryptionEncoder.isEncrypted(value)) {
+            return value;
+        }
+
+        final String encryptedValue = PropertyEncryptionEncoder.getDecoded(value);
+        final SensitivePropertyContext encryptionContext = SensitivePropertyContextFactory.forParameter(context.getName(), parameter.getName());
+        return SensitivePropertyCodec.decrypt(propertyEncryptionProvider, encryptedValue, encryptionContext);
     }
 
 }

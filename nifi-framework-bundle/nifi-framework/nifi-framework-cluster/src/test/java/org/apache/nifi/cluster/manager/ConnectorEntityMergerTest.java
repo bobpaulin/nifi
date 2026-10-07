@@ -17,7 +17,10 @@
 package org.apache.nifi.cluster.manager;
 
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
+import org.apache.nifi.components.connector.FlowEvolutionStatus;
 import org.apache.nifi.web.api.dto.AllowableValueDTO;
+import org.apache.nifi.web.api.dto.BulletinDTO;
+import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.ConfigurationStepConfigurationDTO;
 import org.apache.nifi.web.api.dto.ConnectorActionDTO;
 import org.apache.nifi.web.api.dto.ConnectorConfigurationDTO;
@@ -30,9 +33,11 @@ import org.apache.nifi.web.api.dto.status.ConnectorStatusDTO;
 import org.apache.nifi.web.api.dto.status.ConnectorStatusSnapshotDTO;
 import org.apache.nifi.web.api.dto.status.NodeConnectorStatusSnapshotDTO;
 import org.apache.nifi.web.api.entity.AllowableValueEntity;
+import org.apache.nifi.web.api.entity.BulletinEntity;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
 import org.junit.jupiter.api.Test;
 
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +50,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ConnectorEntityMergerTest {
 
+    private final ConnectorEntityMerger connectorEntityMerger = new ConnectorEntityMerger();
+
     @Test
     void testMergeConnectorState() {
         final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
@@ -56,7 +63,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
         entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         assertEquals("STOPPED", clientEntity.getComponent().getState());
     }
@@ -72,7 +79,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
         entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         assertEquals("RUNNING", clientEntity.getComponent().getState());
     }
@@ -88,17 +95,17 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node", 8001), nodeEntity);
 
         nodeEntity.getComponent().setMultipleVersionsAvailable(false);
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         assertFalse(clientEntity.getComponent().getMultipleVersionsAvailable());
 
         clientEntity.getComponent().setMultipleVersionsAvailable(true);
         nodeEntity.getComponent().setMultipleVersionsAvailable(null);
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         assertFalse(clientEntity.getComponent().getMultipleVersionsAvailable());
 
         clientEntity.getComponent().setMultipleVersionsAvailable(true);
         nodeEntity.getComponent().setMultipleVersionsAvailable(true);
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         assertTrue(clientEntity.getComponent().getMultipleVersionsAvailable());
     }
 
@@ -112,31 +119,154 @@ class ConnectorEntityMergerTest {
 
         clientEntity.getComponent().setAvailableActions(List.of(changeVersionAction(true, null)));
         nodeEntity.getComponent().setAvailableActions(List.of(changeVersionAction(false, "Connector must be stopped")));
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         ConnectorActionDTO mergedAction = findChangeVersionAction(clientEntity);
         assertFalse(mergedAction.getAllowed());
         assertEquals("Connector must be stopped", mergedAction.getReasonNotAllowed());
 
         clientEntity.getComponent().setAvailableActions(List.of(changeVersionAction(true, null)));
         nodeEntity.getComponent().setAvailableActions(List.of(changeVersionAction(null, "Version availability is unknown")));
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         mergedAction = findChangeVersionAction(clientEntity);
         assertFalse(mergedAction.getAllowed());
         assertEquals("Version availability is unknown", mergedAction.getReasonNotAllowed());
 
         clientEntity.getComponent().setAvailableActions(List.of(changeVersionAction(true, null)));
         nodeEntity.getComponent().setAvailableActions(null);
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         mergedAction = findChangeVersionAction(clientEntity);
         assertFalse(mergedAction.getAllowed());
         assertNull(mergedAction.getReasonNotAllowed());
 
         clientEntity.getComponent().setAvailableActions(List.of(changeVersionAction(true, null)));
         nodeEntity.getComponent().setAvailableActions(List.of(changeVersionAction(true, null)));
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         mergedAction = findChangeVersionAction(clientEntity);
         assertTrue(mergedAction.getAllowed());
         assertNull(mergedAction.getReasonNotAllowed());
+    }
+
+    @Test
+    void testMergeRejectsStartWhenNodesLoadDifferentBundles() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity nodeEntity = createConnectorEntity("connector1", "STOPPED");
+        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
+        entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
+        entityMap.put(getNodeIdentifier("node", 8001), nodeEntity);
+        clientEntity.getComponent().setBundle(new BundleDTO("org.apache.nifi", "test-nar", "2.0.0"));
+        nodeEntity.getComponent().setBundle(new BundleDTO("org.apache.nifi", "test-nar", "1.0.0"));
+        clientEntity.getComponent().setAvailableActions(List.of(action("START", true, null), changeVersionAction(true, null)));
+        nodeEntity.getComponent().setAvailableActions(List.of(action("START", true, null), changeVersionAction(true, null)));
+
+        connectorEntityMerger.merge(clientEntity, entityMap);
+
+        final ConnectorActionDTO startAction = findAction(clientEntity, "START");
+        assertFalse(startAction.getAllowed());
+        assertTrue(startAction.getReasonNotAllowed().startsWith(ConnectorEntityMerger.LOADED_BUNDLE_MISMATCH_REASON));
+        assertTrue(startAction.getReasonNotAllowed().contains("localhost:8000=org.apache.nifi:test-nar:2.0.0"));
+        assertTrue(startAction.getReasonNotAllowed().contains("localhost:8001=org.apache.nifi:test-nar:1.0.0"));
+        assertTrue(findChangeVersionAction(clientEntity).getAllowed());
+    }
+
+    @Test
+    void testMergeAllowsStartWhenNodesLoadSameBundle() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity nodeEntity = createConnectorEntity("connector1", "STOPPED");
+        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
+        entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
+        entityMap.put(getNodeIdentifier("node", 8001), nodeEntity);
+        clientEntity.getComponent().setBundle(new BundleDTO("org.apache.nifi", "test-nar", "2.0.0"));
+        nodeEntity.getComponent().setBundle(new BundleDTO("org.apache.nifi", "test-nar", "2.0.0"));
+        clientEntity.getComponent().setAvailableActions(List.of(action("START", true, null)));
+        nodeEntity.getComponent().setAvailableActions(List.of(action("START", true, null)));
+
+        connectorEntityMerger.merge(clientEntity, entityMap);
+
+        assertTrue(findAction(clientEntity, "START").getAllowed());
+        assertNull(findAction(clientEntity, "START").getReasonNotAllowed());
+    }
+
+    @Test
+    void testMergeConnectorBulletinsFromAllNodesInDescendingIdentifierOrder() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity node1Entity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity node2Entity = createConnectorEntity("connector1", "STOPPED");
+        clientEntity.setBulletins(List.of(createBulletin(1, "selected node")));
+        node1Entity.setBulletins(List.of(createBulletin(3, "failure from non-selected node")));
+        node2Entity.setBulletins(List.of(createBulletin(2, "other node")));
+
+        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
+        entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
+        entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
+        entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
+
+        connectorEntityMerger.merge(clientEntity, entityMap);
+
+        assertEquals(List.of(3L, 2L, 1L), clientEntity.getBulletins().stream().map(BulletinEntity::getId).toList());
+        assertEquals("failure from non-selected node", clientEntity.getBulletins().getFirst().getBulletin().getMessage());
+    }
+
+    @Test
+    void testMergeConnectorBulletinsRemovesUnauthorizedContent() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
+        clientEntity.setBulletins(List.of(createBulletin(1, "selected node")));
+        final ConnectorEntity unauthorizedNodeEntity = createConnectorEntity("connector1", "STOPPED");
+        unauthorizedNodeEntity.getPermissions().setCanRead(false);
+        unauthorizedNodeEntity.setComponent(null);
+
+        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
+        entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
+        entityMap.put(getNodeIdentifier("node1", 8001), unauthorizedNodeEntity);
+
+        connectorEntityMerger.merge(clientEntity, entityMap);
+
+        assertFalse(clientEntity.getPermissions().getCanRead());
+        assertNull(clientEntity.getComponent());
+        assertNull(clientEntity.getBulletins());
+    }
+
+    @Test
+    void testMergeFlowEvolutionStatusRequiresEveryNodeComplete() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "DRAINING");
+        final ConnectorEntity node1Entity = createConnectorEntity("connector1", "DRAINING");
+        final ConnectorEntity node2Entity = createConnectorEntity("connector1", "DRAINING");
+        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
+        entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
+        entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
+        entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
+
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
+        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_PENDING.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.PHASE_ONE_PENDING.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
+        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_TWO_COMPLETE.name());
+        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_PENDING.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.PHASE_TWO_COMPLETE.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_PENDING.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.COMMIT_AUTHORIZED.name());
+        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.COMMIT_AUTHORIZED.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name());
+        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.PERSISTENCE_COMPLETE.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.FAILED.name());
+        connectorEntityMerger.merge(clientEntity, entityMap);
+        assertEquals(FlowEvolutionStatus.FAILED.name(), clientEntity.getComponent().getFlowEvolutionStatus());
     }
 
     @Test
@@ -161,7 +291,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
         entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         // Verify working configuration was merged - should only have values present on all nodes
         final ConnectorConfigurationDTO config = clientEntity.getComponent().getWorkingConfiguration();
@@ -192,7 +322,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         final ConnectorConfigurationDTO config = clientEntity.getComponent().getWorkingConfiguration();
         assertNotNull(config);
@@ -213,7 +343,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
         entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         assertEquals("VALIDATING", clientEntity.getStatus().getValidationStatus());
     }
@@ -229,7 +359,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         final ConnectorStatusDTO mergedStatus = clientEntity.getStatus();
         assertNotNull(mergedStatus);
@@ -267,7 +397,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         final ConnectorStatusSnapshotDTO aggregate = clientEntity.getStatus().getAggregateSnapshot();
 
@@ -290,7 +420,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(clientNodeId, clientEntity);
         entityMap.put(node1NodeId, node1Entity);
 
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
 
         final List<NodeConnectorStatusSnapshotDTO> nodeSnapshots = clientEntity.getStatus().getNodeSnapshots();
         assertEquals(2, nodeSnapshots.size());
@@ -326,7 +456,7 @@ class ConnectorEntityMergerTest {
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
 
         // Both have null status - should not throw
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
+        connectorEntityMerger.merge(clientEntity, entityMap);
         assertNull(clientEntity.getStatus());
     }
 
@@ -339,9 +469,21 @@ class ConnectorEntityMergerTest {
         return action;
     }
 
+    private ConnectorActionDTO action(final String name, final Boolean allowed, final String reasonNotAllowed) {
+        final ConnectorActionDTO action = new ConnectorActionDTO();
+        action.setName(name);
+        action.setAllowed(allowed);
+        action.setReasonNotAllowed(reasonNotAllowed);
+        return action;
+    }
+
     private ConnectorActionDTO findChangeVersionAction(final ConnectorEntity entity) {
+        return findAction(entity, "CHANGE_VERSION");
+    }
+
+    private ConnectorActionDTO findAction(final ConnectorEntity entity, final String actionName) {
         for (final ConnectorActionDTO action : entity.getComponent().getAvailableActions()) {
-            if ("CHANGE_VERSION".equals(action.getName())) {
+            if (actionName.equals(action.getName())) {
                 return action;
             }
         }
@@ -369,6 +511,20 @@ class ConnectorEntityMergerTest {
         entity.setRevision(createNewRevision());
         entity.setPermissions(permissions);
 
+        return entity;
+    }
+
+    private BulletinEntity createBulletin(final long id, final String message) {
+        final BulletinDTO bulletin = new BulletinDTO();
+        bulletin.setId(id);
+        bulletin.setMessage(message);
+        bulletin.setTimestamp(new Date(id));
+
+        final BulletinEntity entity = new BulletinEntity();
+        entity.setId(id);
+        entity.setTimestamp(bulletin.getTimestamp());
+        entity.setCanRead(true);
+        entity.setBulletin(bulletin);
         return entity;
     }
 

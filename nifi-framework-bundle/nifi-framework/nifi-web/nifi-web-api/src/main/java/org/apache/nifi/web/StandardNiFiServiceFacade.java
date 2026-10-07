@@ -3719,7 +3719,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(connector);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(connector));
         final ConnectorStatusDTO status = createConnectorStatusDto(connector);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, status);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, status, null);
     }
 
     @Override
@@ -3730,7 +3730,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
             final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
             final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
             final ConnectorStatusDTO status = createConnectorStatusDto(node);
-            return entityFactory.createConnectorEntity(dto, revision, permissions, operatePermissions, status);
+            return entityFactory.createConnectorEntity(dto, revision, permissions, operatePermissions, status, null);
         }).collect(Collectors.toSet());
     }
 
@@ -3764,14 +3764,20 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         }
 
         final ConnectorStatusDTO status = createConnectorStatusDto(node);
-        final ConnectorEntity entity = entityFactory.createConnectorEntity(dto, revision, permissions, operatePermissions, status);
+        final List<BulletinDTO> bulletins = dtoFactory.createBulletinDtos(bulletinRepository.findBulletinsForSource(node.getIdentifier()));
+        final List<BulletinEntity> bulletinEntities = bulletins.stream()
+                .map(bulletin -> entityFactory.createBulletinEntity(bulletin, permissions.getCanRead()))
+                .collect(Collectors.toList());
+        final ConnectorEntity entity = entityFactory.createConnectorEntity(dto, revision, permissions, operatePermissions, status, bulletinEntities);
         logger.debug("getConnector: id=[{}] — entity created, component={}", id, entity.getComponent() != null ? "present" : "null");
         return entity;
     }
 
     @Override
     public void verifyUpdateConnector(final ConnectorDTO connectorDTO) {
-        final ConnectorNode connector = connectorDAO.getConnector(connectorDTO.getId());
+        // Run-status verification shares this method. Loading the provider here would apply an external edit that
+        // the caller has not synchronized, so start and stop must see only the in-memory configuration.
+        final ConnectorNode connector = connectorDAO.getConnector(connectorDTO.getId(), ConnectorSyncMode.LOCAL_ONLY);
         final ConnectorState currentState = connector.getCurrentState();
 
         if ((connectorDTO.getName() != null || connectorDTO.getBundle() != null) && currentState == ConnectorState.TROUBLESHOOTING) {
@@ -3782,6 +3788,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         if (connectorDTO.getBundle() != null) {
             final BundleCoordinate incomingCoordinate = BundleUtils.getBundle(controllerFacade.getExtensionManager(), connector.getCanonicalClassName(), connectorDTO.getBundle());
             if (!incomingCoordinate.equals(connector.getBundleCoordinate())) {
+                verifyClusterConnectedForVersionChange(connectorDTO.getId());
                 connector.verifyCanUpdateBundle(incomingCoordinate);
                 connector.verifyCanReload();
             }
@@ -3830,7 +3837,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -3860,7 +3867,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO operatePermissions = new PermissionsDTO();
         operatePermissions.setCanRead(Boolean.FALSE);
         operatePermissions.setCanWrite(Boolean.FALSE);
-        return entityFactory.createConnectorEntity(dto, dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, null);
+        return entityFactory.createConnectorEntity(dto, dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, null, null);
     }
 
     @Override
@@ -3874,7 +3881,13 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
                 case STOPPED -> connectorDAO.stopConnector(id);
                 default -> throw new IllegalArgumentException("Unsupported scheduled state for Connector: " + state);
             }
-            controllerFacade.save();
+            // Evolution sets the desired state to RUNNING as soon as it is claimed so a joining node starts too.
+            // Persisting that state before the hook succeeds makes a failed evolution auto-start on restart.
+            // The evolution coordinator saves after a successful commit, and a failure puts the desired state back.
+            final ConnectorNode scheduled = connectorDAO.getConnector(id, ConnectorSyncMode.LOCAL_ONLY);
+            if (scheduled.getCurrentState() != ConnectorState.DRAINING || !scheduled.isPendingFlowEvolution()) {
+                controllerFacade.save();
+            }
 
             final ConnectorNode node = connectorDAO.getConnector(id, ConnectorSyncMode.LOCAL_ONLY);
             final ConnectorDTO dto = dtoFactory.createConnectorDto(node);
@@ -3886,7 +3899,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -3917,7 +3930,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -3944,7 +3957,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -3971,7 +3984,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -3985,6 +3998,22 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         }
 
         connectorDAO.verifyEndTroubleshooting(id);
+    }
+
+    /**
+     * Every node must drain a version change together, and a node that misses the change keeps the outgoing version. The change
+     * therefore requires every node to be CONNECTED, and acknowledging a disconnected node does not relax this requirement.
+     */
+    private void verifyClusterConnectedForVersionChange(final String connectorId) {
+        if (clusterCoordinator == null) {
+            return;
+        }
+
+        final List<NodeIdentifier> unconnectedNodes = getUnconnectedNodes();
+        if (!clusterCoordinator.isConnected() || !unconnectedNodes.isEmpty()) {
+            throw new IllegalStateException("Cannot change the version of Connector " + connectorId + " because the following cluster nodes are not CONNECTED: "
+                    + (unconnectedNodes.isEmpty() ? "this node" : unconnectedNodes) + ". All nodes must be CONNECTED before the version may change.");
+        }
     }
 
     private List<NodeIdentifier> getUnconnectedNodes() {
@@ -4022,7 +4051,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -4082,7 +4111,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -4103,7 +4132,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(node);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(node));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(node);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     @Override
@@ -4351,7 +4380,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
         final PermissionsDTO permissions = dtoFactory.createPermissionsDto(connectorNode);
         final PermissionsDTO operatePermissions = dtoFactory.createPermissionsDto(new OperationAuthorizable(connectorNode));
         final ConnectorStatusDTO statusDto = createConnectorStatusDto(connectorNode);
-        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto);
+        return entityFactory.createConnectorEntity(snapshot.getComponent(), dtoFactory.createRevisionDTO(snapshot.getLastModification()), permissions, operatePermissions, statusDto, null);
     }
 
     private VersionedFlowMigrationSourceDTO createVersionedFlowMigrationSourceDto(final ConnectorMigrationSource migrationSource) {

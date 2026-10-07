@@ -972,6 +972,12 @@ public class FlowController implements ReportingTaskProvider, FlowAnalysisRulePr
             final long syncTimeoutMillis = FormatUtils.getTimeDuration(syncTimeoutValue, TimeUnit.MILLISECONDS);
             final Duration connectorSyncTimeout = Duration.ofMillis(syncTimeoutMillis);
 
+            if (created instanceof final StandardConnectorRepository standardConnectorRepository) {
+                final String evolutionTimeoutValue = properties.getProperty(NiFiProperties.CONNECTOR_FLOW_EVOLUTION_TIMEOUT, NiFiProperties.DEFAULT_CONNECTOR_FLOW_EVOLUTION_TIMEOUT);
+                final long evolutionTimeoutMillis = FormatUtils.getTimeDuration(evolutionTimeoutValue, TimeUnit.MILLISECONDS);
+                standardConnectorRepository.setFlowEvolutionTimeout(Duration.ofMillis(evolutionTimeoutMillis));
+            }
+
             final ConnectorRepositoryInitializationContext initializationContext = new StandardConnectorRepoInitializationContext(
                 flowManager,
                 extensionManager,
@@ -2049,6 +2055,8 @@ public class FlowController implements ReportingTaskProvider, FlowAnalysisRulePr
             if (loadBalanceClientRegistry != null) {
                 loadBalanceClientRegistry.stop();
             }
+
+            connectorRepository.shutdown();
 
             if (processScheduler != null) {
                 processScheduler.shutdown();

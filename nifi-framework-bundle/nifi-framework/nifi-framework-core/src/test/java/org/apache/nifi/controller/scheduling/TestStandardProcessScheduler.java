@@ -681,6 +681,51 @@ public class TestStandardProcessScheduler {
     }
 
     @Test
+    @Timeout(10)
+    public void testRepeatedStartCompletesWhenStartingOrRunning() throws Exception {
+        final Map<String, String> overrideProperties = new HashMap<>();
+        overrideProperties.put(NiFiProperties.ADMINISTRATIVE_YIELD_DURATION, "2 millis");
+        overrideProperties.put(NiFiProperties.PROCESSOR_SCHEDULING_TIMEOUT, "30 secs");
+        final NiFiProperties properties = NiFiProperties.createBasicNiFiProperties(propsFile, overrideProperties);
+        final StandardProcessScheduler longTimeoutScheduler = new StandardProcessScheduler(new FlowEngine(1, "Repeated Start Test", true),
+            mock(FlowController.class), stateMgrProvider, properties, new StandardLifecycleStateManager());
+        longTimeoutScheduler.setSchedulingAgent(SchedulingStrategy.TIMER_DRIVEN, mock(SchedulingAgent.class));
+
+        final CountDownLatch onScheduledEntered = new CountDownLatch(1);
+        final CountDownLatch releaseOnScheduled = new CountDownLatch(1);
+        final String identifier = UUID.randomUUID().toString();
+        final Processor processor = new BlockingOnScheduledProcessor(onScheduledEntered, releaseOnScheduled);
+        processor.initialize(new StandardProcessorInitializationContext(identifier, null, null, null, KerberosConfig.NOT_CONFIGURED));
+        final LoggableComponent<Processor> loggableComponent = new LoggableComponent<>(processor, systemBundle.getBundleDetails().getCoordinate(), null);
+        final ProcessorNode processorNode = new StandardProcessorNode(loggableComponent, identifier, new StandardValidationContextFactory(serviceProvider), longTimeoutScheduler,
+            serviceProvider, mock(ReloadComponent.class), mock(VerifiableComponentFactory.class), extensionManager, new SynchronousValidationTrigger());
+        rootGroup.addProcessor(processorNode);
+        processorNode.performValidation();
+
+        try {
+            final CompletableFuture<Void> firstStart = longTimeoutScheduler.startProcessor(processorNode, true);
+            assertTrue(onScheduledEntered.await(5, TimeUnit.SECONDS));
+            assertEquals(ScheduledState.STARTING, processorNode.getPhysicalScheduledState());
+
+            final CompletableFuture<Void> secondStart = longTimeoutScheduler.startProcessor(processorNode, true);
+            assertSame(firstStart, secondStart);
+            assertFalse(firstStart.isDone());
+
+            releaseOnScheduled.countDown();
+            firstStart.get(5, TimeUnit.SECONDS);
+            assertTrue(secondStart.isDone());
+            assertEquals(ScheduledState.RUNNING, processorNode.getPhysicalScheduledState());
+
+            final CompletableFuture<Void> runningStart = longTimeoutScheduler.startProcessor(processorNode, true);
+            assertTrue(runningStart.isDone());
+            runningStart.get(1, TimeUnit.SECONDS);
+        } finally {
+            releaseOnScheduled.countDown();
+            longTimeoutScheduler.shutdown();
+        }
+    }
+
+    @Test
     public void testFunnelCanStartAfterSchedulingFailure() {
         final SchedulingAgent schedulingAgent = mock(SchedulingAgent.class);
         final IllegalStateException schedulingFailure = new IllegalStateException("Scheduling failed");
@@ -999,6 +1044,26 @@ public class TestStandardProcessScheduler {
     }
 
     public static class NoOpProcessor extends AbstractProcessor {
+        @Override
+        public void onTrigger(final ProcessContext context, final ProcessSession session) {
+        }
+    }
+
+    public static class BlockingOnScheduledProcessor extends AbstractProcessor {
+        private final CountDownLatch onScheduledEntered;
+        private final CountDownLatch releaseOnScheduled;
+
+        public BlockingOnScheduledProcessor(final CountDownLatch onScheduledEntered, final CountDownLatch releaseOnScheduled) {
+            this.onScheduledEntered = onScheduledEntered;
+            this.releaseOnScheduled = releaseOnScheduled;
+        }
+
+        @OnScheduled
+        public void onScheduled() throws InterruptedException {
+            onScheduledEntered.countDown();
+            releaseOnScheduled.await();
+        }
+
         @Override
         public void onTrigger(final ProcessContext context, final ProcessSession session) {
         }

@@ -134,7 +134,8 @@ public final class EntityFactory {
                                                  final RevisionDTO revision,
                                                  final PermissionsDTO permissions,
                                                  final PermissionsDTO operatePermissions,
-                                                 final ConnectorStatusDTO status) {
+                                                 final ConnectorStatusDTO status,
+                                                 final List<BulletinEntity> bulletins) {
         final ConnectorEntity entity = new ConnectorEntity();
         entity.setRevision(revision);
         if (dto != null) {
@@ -144,6 +145,7 @@ public final class EntityFactory {
             entity.setId(dto.getId());
             if (permissions != null && permissions.getCanRead()) {
                 entity.setComponent(dto);
+                entity.setBulletins(bulletins);
             }
         }
         return entity;

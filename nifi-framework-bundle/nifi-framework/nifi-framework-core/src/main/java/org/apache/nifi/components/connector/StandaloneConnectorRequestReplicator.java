@@ -19,7 +19,7 @@ package org.apache.nifi.components.connector;
 
 import org.apache.nifi.controller.flow.FlowManager;
 
-public class StandaloneConnectorRequestReplicator implements ConnectorRequestReplicator {
+public class StandaloneConnectorRequestReplicator implements FlowEvolutionRequestReplicator {
 
     private FlowManager flowManager;
 
@@ -31,6 +31,20 @@ public class StandaloneConnectorRequestReplicator implements ConnectorRequestRep
         }
 
         return connectorNode.getCurrentState();
+    }
+
+    @Override
+    public FlowEvolutionStatus getFlowEvolutionStatus(final String connectorId) {
+        final ConnectorNode connectorNode = flowManager.getConnector(connectorId);
+        if (connectorNode == null) {
+            throw new IllegalArgumentException("No connector found with id: " + connectorId);
+        }
+
+        return connectorNode.getFlowEvolutionStatus();
+    }
+
+    @Override
+    public void resetFlowEvolutionParticipants(final String connectorId) {
     }
 
     @Override

@@ -18,6 +18,8 @@ package org.apache.nifi.cluster.manager;
 
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
 import org.apache.nifi.components.connector.ConnectorState;
+import org.apache.nifi.components.connector.FlowEvolutionStatus;
+import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.ConfigurationStepConfigurationDTO;
 import org.apache.nifi.web.api.dto.ConnectorActionDTO;
 import org.apache.nifi.web.api.dto.ConnectorConfigurationDTO;
@@ -28,18 +30,31 @@ import org.apache.nifi.web.api.entity.ConnectorEntity;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
-public class ConnectorEntityMerger {
+public class ConnectorEntityMerger implements ComponentEntityMerger<ConnectorEntity> {
+    public static final String LOADED_BUNDLE_MISMATCH_REASON = "Cluster nodes load different Connector versions: ";
+
     private static final String CHANGE_VERSION_ACTION = "CHANGE_VERSION";
+    private static final String START_ACTION = "START";
+
     /**
      * Merges the ConnectorEntity responses.
      *
      * @param clientEntity the entity being returned to the client
      * @param entityMap all node responses
      */
-    public static void merge(final ConnectorEntity clientEntity, final Map<NodeIdentifier, ConnectorEntity> entityMap) {
+    @Override
+    public void merge(final ConnectorEntity clientEntity, final Map<NodeIdentifier, ConnectorEntity> entityMap) {
+        ComponentEntityMerger.super.merge(clientEntity, entityMap);
+        mergeStatus(clientEntity, entityMap);
+    }
+
+    @Override
+    public void mergeComponents(final ConnectorEntity clientEntity, final Map<NodeIdentifier, ConnectorEntity> entityMap) {
         final ConnectorDTO clientDto = clientEntity.getComponent();
         final Map<NodeIdentifier, ConnectorDTO> dtoMap = new HashMap<>();
         for (final Map.Entry<NodeIdentifier, ConnectorEntity> entry : entityMap.entrySet()) {
@@ -49,8 +64,6 @@ public class ConnectorEntityMerger {
         }
 
         mergeDtos(clientDto, dtoMap);
-
-        mergeStatus(clientEntity, entityMap);
     }
 
     private static void mergeStatus(final ConnectorEntity clientEntity, final Map<NodeIdentifier, ConnectorEntity> entityMap) {
@@ -113,7 +126,9 @@ public class ConnectorEntityMerger {
         }
 
         mergeChangeVersion(clientDto, dtoMap);
+        mergeLoadedBundles(clientDto, dtoMap);
         mergeState(clientDto, dtoMap);
+        mergeFlowEvolutionStatus(clientDto, dtoMap);
 
         // Merge configuration steps to handle dynamic property descriptors
         mergeActiveConfiguration(clientDto, dtoMap);
@@ -138,6 +153,34 @@ public class ConnectorEntityMerger {
             final ConnectorActionDTO clientAction = findOrCreateChangeVersionAction(clientDto);
             clientAction.setAllowed(Boolean.FALSE);
             clientAction.setReasonNotAllowed(nodeAction == null ? null : nodeAction.getReasonNotAllowed());
+        }
+    }
+
+    /**
+     * Nodes that load different Connector versions would evolve to different flows, so START is not allowed until every node
+     * loads the same bundle.
+     */
+    private static void mergeLoadedBundles(final ConnectorDTO clientDto, final Map<NodeIdentifier, ConnectorDTO> dtoMap) {
+        final Map<String, String> loadedBundles = new TreeMap<>();
+        for (final Map.Entry<NodeIdentifier, ConnectorDTO> entry : dtoMap.entrySet()) {
+            final ConnectorDTO nodeConnector = entry.getValue();
+            if (nodeConnector == null || nodeConnector.getBundle() == null) {
+                continue;
+            }
+
+            final BundleDTO bundle = nodeConnector.getBundle();
+            loadedBundles.put(entry.getKey().getApiAddress() + ":" + entry.getKey().getApiPort(),
+                    bundle.getGroup() + ":" + bundle.getArtifact() + ":" + bundle.getVersion());
+        }
+
+        if (new HashSet<>(loadedBundles.values()).size() <= 1) {
+            return;
+        }
+
+        final ConnectorActionDTO startAction = findAction(clientDto, START_ACTION);
+        if (startAction != null) {
+            startAction.setAllowed(Boolean.FALSE);
+            startAction.setReasonNotAllowed(LOADED_BUNDLE_MISMATCH_REASON + loadedBundles);
         }
     }
 
@@ -200,6 +243,25 @@ public class ConnectorEntityMerger {
         }
 
         clientDto.setState(mergedState);
+    }
+
+    private static void mergeFlowEvolutionStatus(final ConnectorDTO clientDto, final Map<NodeIdentifier, ConnectorDTO> dtoMap) {
+        FlowEvolutionStatus mergedStatus = FlowEvolutionStatus.PERSISTENCE_COMPLETE;
+
+        for (final ConnectorDTO nodeConnector : dtoMap.values()) {
+            final String statusName = nodeConnector == null ? null : nodeConnector.getFlowEvolutionStatus();
+            final FlowEvolutionStatus status = statusName == null ? FlowEvolutionStatus.INACTIVE : FlowEvolutionStatus.valueOf(statusName);
+            if (status == FlowEvolutionStatus.FAILED) {
+                clientDto.setFlowEvolutionStatus(FlowEvolutionStatus.FAILED.name());
+                return;
+            }
+
+            if (status.ordinal() < mergedStatus.ordinal()) {
+                mergedStatus = status;
+            }
+        }
+
+        clientDto.setFlowEvolutionStatus(mergedStatus.name());
     }
 
     private static int getStatePriority(final String state) {

@@ -21,24 +21,37 @@ import org.apache.nifi.asset.Asset;
 import org.apache.nifi.asset.AssetManager;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.ConfigVerificationResult;
+import org.apache.nifi.components.connector.ConnectorTestSupport.Harness;
+import org.apache.nifi.components.connector.ConnectorTestSupport.RecordingConnector;
 import org.apache.nifi.components.connector.components.FlowContext;
 import org.apache.nifi.components.connector.components.FlowContextType;
+import org.apache.nifi.components.connector.components.ProcessGroupFacade;
+import org.apache.nifi.components.connector.components.ProcessGroupLifecycle;
 import org.apache.nifi.components.connector.secrets.SecretsManager;
+import org.apache.nifi.connectable.Position;
 import org.apache.nifi.controller.MockStateManagerProvider;
 import org.apache.nifi.controller.ParameterProviderNode;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.queue.QueueSize;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.flow.Bundle;
+import org.apache.nifi.flow.ComponentType;
+import org.apache.nifi.flow.ExecutionEngine;
 import org.apache.nifi.flow.VersionedConfigurationStep;
 import org.apache.nifi.flow.VersionedConnector;
 import org.apache.nifi.flow.VersionedConnectorState;
 import org.apache.nifi.flow.VersionedConnectorValueReference;
+import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedExternalFlow;
 import org.apache.nifi.flow.VersionedProcessGroup;
+import org.apache.nifi.flow.VersionedProcessor;
+import org.apache.nifi.groups.FlowFileConcurrency;
+import org.apache.nifi.groups.FlowFileOutboundPolicy;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.migration.ConnectorPropertyConfiguration;
 import org.apache.nifi.nar.ExtensionManager;
+import org.apache.nifi.security.encryption.PropertyEncryptionProvider;
 import org.apache.nifi.util.MockComponentLog;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -57,12 +70,24 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.apache.nifi.components.connector.ConnectorTestSupport.flowGroup;
+import static org.apache.nifi.components.connector.ConnectorTestSupport.harness;
+import static org.apache.nifi.components.connector.ConnectorTestSupport.versioned;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -72,8 +97,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -146,7 +174,7 @@ public class TestStandardConnectorRepository {
         // At restore time the Connector's managed flow has not yet been synchronized: its Managed Process Group
         // and managed Parameter Context are empty, so its flow contexts reference no assets. Deleting assets here
         // would discard assets that the Connector's not-yet-restored flow still references. A Connector restored in
-        // Troubleshooting mode relies on these assets surviving until restoreTroubleshootingFlow re-establishes the
+        // Troubleshooting mode relies on these assets surviving until the persisted managed flow re-establishes the
         // references, so restoreConnector must not delete any assets.
         final Asset asset = mock(Asset.class);
         when(asset.getIdentifier()).thenReturn("asset-1");
@@ -550,6 +578,22 @@ public class TestStandardConnectorRepository {
         assertNotNull(result);
         verifyNoInteractions(provider);
         verify(connector, never()).setName(anyString());
+    }
+
+    @Test
+    public void testProviderSyncSkippedWhileDraining() {
+        final ConnectorConfigurationProvider provider = mock(ConnectorConfigurationProvider.class);
+        final StandardConnectorRepository repository = createRepositoryWithProvider(provider);
+
+        final ConnectorNode connector = createSimpleConnectorNode("connector-1", "Local Name");
+        when(connector.getCurrentState()).thenReturn(ConnectorState.DRAINING);
+        repository.restoreConnector(connector);
+        reset(provider);
+
+        final ConnectorNode result = repository.getConnector("connector-1", ConnectorSyncMode.SYNC_WITH_PROVIDER);
+
+        assertNotNull(result);
+        verifyNoInteractions(provider);
     }
 
     @Test
@@ -1864,7 +1908,7 @@ public class TestStandardConnectorRepository {
         // therefore not persisted in flow.json. When restoring a Connector whose effective scheduled state is
         // TROUBLESHOOTING, the framework must run inheritConfiguration so the Connector re-populates its in-memory
         // Parameter Context from the persisted active configuration. The Connector-supplied flow shape that produces
-        // is then overlaid by restoreTroubleshootingFlow with the user's persisted snapshot before the FlowFile Repository
+        // is then replaced by the persisted managed group, which holds the user's edits, before the FlowFile Repository
         // attaches FlowFiles to queues, so the transient Connector flow shape is invisible to data movement.
         final List<VersionedConfigurationStep> activeConfig = List.of(
                 createVersionedStep("step1", Map.of("prop1", createStringLiteralRef("new-value"))));
@@ -1880,7 +1924,7 @@ public class TestStandardConnectorRepository {
         final FrameworkFlowContext activeFlowContext = connector.getActiveFlowContext();
         final InOrder inOrder = inOrder(connector, activeFlowContext);
         inOrder.verify(connector).inheritConfiguration(eq(activeConfig), eq(activeConfig), any());
-        inOrder.verify(activeFlowContext).restoreTroubleshootingFlow(persistedManagedGroup);
+        inOrder.verify(activeFlowContext).restorePersistedFlow(persistedManagedGroup, null);
         inOrder.verify(connector).restoreTroubleshootingState();
     }
 
@@ -1901,7 +1945,7 @@ public class TestStandardConnectorRepository {
 
         assertEquals(ConnectorSyncResult.Outcome.SYNCED_CONFIG_UNCHANGED, result.getOutcome());
         verify(connector).inheritConfiguration(eq(List.of()), eq(List.of()), any());
-        verify(connector.getActiveFlowContext()).restoreTroubleshootingFlow(persistedManagedGroup);
+        verify(connector.getActiveFlowContext()).restorePersistedFlow(persistedManagedGroup, null);
         // Connector is already in TROUBLESHOOTING; restoreTroubleshootingState should not be invoked again.
         verify(connector, never()).restoreTroubleshootingState();
     }
@@ -1921,7 +1965,7 @@ public class TestStandardConnectorRepository {
 
         assertEquals(ConnectorSyncResult.Outcome.SYNCED_CONFIG_UNCHANGED, result.getOutcome());
         verify(connector).inheritConfiguration(eq(List.of()), eq(List.of()), any());
-        verify(connector.getActiveFlowContext(), never()).restoreTroubleshootingFlow(any());
+        verify(connector.getActiveFlowContext(), never()).restorePersistedFlow(any(), any());
         verify(connector).restoreTroubleshootingState();
     }
 
@@ -1932,7 +1976,7 @@ public class TestStandardConnectorRepository {
         final ConnectorNode connector = createConnectorNodeWithEmptyWorkingConfig("connector-1", "Test Connector");
         when(connector.getCurrentState()).thenReturn(ConnectorState.STOPPED);
         final FrameworkFlowContext activeFlowContext = connector.getActiveFlowContext();
-        doThrow(new RuntimeException("Snapshot restore failure")).when(activeFlowContext).restoreTroubleshootingFlow(any());
+        doThrow(new RuntimeException("Snapshot restore failure")).when(activeFlowContext).restorePersistedFlow(any(), any());
         repository.restoreConnector(connector);
 
         final VersionedProcessGroup persistedManagedGroup = new VersionedProcessGroup();
@@ -1965,9 +2009,9 @@ public class TestStandardConnectorRepository {
         final ConnectorSyncResult result = repository.syncConnector(versioned);
 
         assertEquals(ConnectorSyncResult.Outcome.FAILED, result.getOutcome());
-        // inheritConfiguration ran first and failed; the managed flow snapshot must not be overlaid and the
+        // inheritConfiguration ran first and failed; the managed flow must not be restored and the
         // Connector must not transition into TROUBLESHOOTING.
-        verify(connector.getActiveFlowContext(), never()).restoreTroubleshootingFlow(any());
+        verify(connector.getActiveFlowContext(), never()).restorePersistedFlow(any(), any());
         verify(connector, never()).restoreTroubleshootingState();
     }
 
@@ -2851,6 +2895,27 @@ public class TestStandardConnectorRepository {
         final ProcessGroup managedProcessGroup = mock(ProcessGroup.class);
         when(managedProcessGroup.purge()).thenReturn(CompletableFuture.completedFuture(null));
         when(managedProcessGroup.getQueueSize()).thenReturn(new QueueSize(0, 0L));
+        when(managedProcessGroup.getIdentifier()).thenReturn("managed-group");
+        when(managedProcessGroup.getProcessGroupIdentifier()).thenReturn("managed-group");
+        when(managedProcessGroup.getVersionedComponentId()).thenReturn(Optional.of("managed-group-versioned"));
+        when(managedProcessGroup.getName()).thenReturn("Managed Group");
+        when(managedProcessGroup.getPosition()).thenReturn(new Position(0, 0));
+        when(managedProcessGroup.getFlowFileConcurrency()).thenReturn(FlowFileConcurrency.UNBOUNDED);
+        when(managedProcessGroup.getFlowFileOutboundPolicy()).thenReturn(FlowFileOutboundPolicy.STREAM_WHEN_AVAILABLE);
+        when(managedProcessGroup.getExecutionEngine()).thenReturn(ExecutionEngine.INHERITED);
+        when(managedProcessGroup.getProcessors()).thenReturn(Set.of());
+        when(managedProcessGroup.getProcessGroups()).thenReturn(Set.of());
+        when(managedProcessGroup.getInputPorts()).thenReturn(Set.of());
+        when(managedProcessGroup.getOutputPorts()).thenReturn(Set.of());
+        when(managedProcessGroup.getRemoteProcessGroups()).thenReturn(Set.of());
+        when(managedProcessGroup.getControllerServices(false)).thenReturn(Set.of());
+        when(managedProcessGroup.getConnections()).thenReturn(Set.of());
+        final ProcessGroupLifecycle lifecycle = mock(ProcessGroupLifecycle.class);
+        when(lifecycle.stop()).thenReturn(CompletableFuture.completedFuture(null));
+        final ProcessGroupFacade rootGroup = mock(ProcessGroupFacade.class);
+        when(rootGroup.getLifecycle()).thenReturn(lifecycle);
+        final ProcessGroupFacadeFactory groupFacadeFactory = mock(ProcessGroupFacadeFactory.class);
+        when(groupFacadeFactory.create(any(ProcessGroup.class), any(ComponentLog.class))).thenReturn(rootGroup);
 
         final FlowContextFactory flowContextFactory = new FlowContextFactory() {
             @Override
@@ -2858,7 +2923,7 @@ public class TestStandardConnectorRepository {
                 final MutableConnectorConfigurationContext activeConfigurationContext =
                         new StandardConnectorConfigurationContext(assetManager, secretsManager);
                 return new StandardFlowContext(managedProcessGroup, activeConfigurationContext,
-                        mock(ProcessGroupFacadeFactory.class), mock(ParameterContextFacadeFactory.class),
+                        groupFacadeFactory, mock(ParameterContextFacadeFactory.class),
                         connectorLogger, FlowContextType.ACTIVE, bundle);
             }
 
@@ -2866,7 +2931,7 @@ public class TestStandardConnectorRepository {
             public FrameworkFlowContext createWorkingFlowContext(final String connectorId, final ComponentLog connectorLogger,
                     final MutableConnectorConfigurationContext currentConfiguration, final Bundle bundle) {
                 return new StandardFlowContext(managedProcessGroup, currentConfiguration,
-                        mock(ProcessGroupFacadeFactory.class), mock(ParameterContextFacadeFactory.class),
+                        groupFacadeFactory, mock(ParameterContextFacadeFactory.class),
                         connectorLogger, FlowContextType.WORKING, bundle);
             }
         };
@@ -2888,8 +2953,11 @@ public class TestStandardConnectorRepository {
         final BundleCoordinate bundleCoordinate = new BundleCoordinate("org.apache.nifi", "test-standard-connector-node", "1.0.0");
         final ConnectorDetails connectorDetails = new ConnectorDetails(connector, bundleCoordinate, componentLog);
 
+        final FlowManager flowManager = mock(FlowManager.class);
+        when(flowManager.getPropertyEncryptionProvider()).thenReturn(mock(PropertyEncryptionProvider.class));
+        when(flowManager.getControllerServiceProvider()).thenReturn(mock(ControllerServiceProvider.class));
         final StandardConnectorNode node = new StandardConnectorNode(
-                identifier, mock(FlowManager.class), extensionManager, new MockStateManagerProvider(), null, connectorDetails,
+                identifier, flowManager, extensionManager, new MockStateManagerProvider(), null, connectorDetails,
                 "TestConnector", connector.getClass().getCanonicalName(),
                 new StandardConnectorConfigurationContext(assetManager, secretsManager),
                 stateTransition, flowContextFactory, validationTrigger, false);
@@ -3215,6 +3283,454 @@ public class TestStandardConnectorRepository {
         public List<ConfigVerificationResult> verifyConfigurationStep(final String stepName, final Map<String, String> overrides, final FlowContext flowContext) {
             return List.of();
         }
+    }
+
+
+    @Test
+    public void testPendingEvolutionLeavesComponentBundleWhenSeveralAlternativesExist() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.repository.restoreConnector(harness.node);
+        useBundleLookup(harness, List.of(
+            componentBundle("org.apache.nifi", "processor-nar", "2.0.0"),
+            componentBundle("org.apache.nifi", "processor-nar", "3.0.0")));
+        final VersionedProcessGroup persisted = componentGroup("outgoing-flow", componentBundle("org.apache.nifi", "processor-nar", "1.0.0"));
+
+        harness.repository.syncConnector(versioned(new Bundle("org.apache.nifi", "test-nar", "1.0.0"), persisted, VersionedConnectorState.ENABLED));
+
+        assertEquals("1.0.0", persisted.getProcessors().iterator().next().getBundle().getVersion());
+        assertEquals("1.0.0", harness.node.getAuthoritativeManagedProcessGroup().getProcessors().iterator().next().getBundle().getVersion());
+    }
+
+    @Test
+    public void testGhostConnectorDoesNotResolvePersistedComponentBundles() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), true);
+        harness.repository.restoreConnector(harness.node);
+        useBundleLookup(harness, List.of(componentBundle("org.apache.nifi", "processor-nar", "2.0.0")));
+        final VersionedProcessGroup persisted = componentGroup("ghost-flow", componentBundle("org.apache.nifi", "processor-nar", "1.0.0"));
+
+        harness.repository.syncConnector(versioned(new Bundle("org.apache.nifi", "test-nar", "1.0.0"), persisted, VersionedConnectorState.ENABLED));
+
+        assertTrue(harness.node.isExtensionMissing());
+        assertEquals("1.0.0", persisted.getProcessors().iterator().next().getBundle().getVersion());
+        assertEquals("1.0.0", harness.node.getAuthoritativeManagedProcessGroup().getProcessors().iterator().next().getBundle().getVersion());
+    }
+
+    @Test
+    public void testGhostSyncWithoutPersistedFlowInstallsNothing() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), true);
+        harness.repository.restoreConnector(harness.node);
+
+        harness.repository.syncConnector(versioned(new Bundle("org.apache.nifi", "test-nar", "1.0.0"), null, VersionedConnectorState.ENABLED));
+
+        verify(harness.processGroup, never()).restoreFlowPreservingIdentifiers(any(), anyBoolean());
+        verify(harness.processGroup, never()).restoreFlowPreservingIdentifiers(any());
+        assertFalse(harness.node.isManagedFlowMissingAtStartup());
+    }
+
+    @Test
+    public void testGhostSyncTroubleshootingInstallsPersistedFlowOnce() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), true);
+        harness.repository.restoreConnector(harness.node);
+        final VersionedProcessGroup persisted = flowGroup("ghost-edits");
+
+        harness.repository.syncConnector(versioned(new Bundle("org.apache.nifi", "test-nar", "1.0.0"), persisted, VersionedConnectorState.TROUBLESHOOTING));
+
+        verify(harness.processGroup, never()).restoreFlowPreservingIdentifiers(any(), anyBoolean());
+        verify(harness.processGroup, times(1)).restoreFlowPreservingIdentifiers(argThat(flow -> flow.getFlowContents() == persisted));
+    }
+
+    @Test
+    public void testGhostSyncRestoreFailureFlagsConnectorAndAdoptsSnapshot() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), true);
+        harness.repository.restoreConnector(harness.node);
+        doThrow(new IllegalStateException("Expected restore failure")).when(harness.processGroup).restoreFlowPreservingIdentifiers(any(), eq(false));
+        final VersionedProcessGroup persisted = flowGroup("ghost-flow");
+
+        final ConnectorSyncResult result = harness.repository.syncConnector(
+            versioned(new Bundle("org.apache.nifi", "test-nar", "1.0.0"), persisted, VersionedConnectorState.ENABLED));
+
+        assertNotEquals(ConnectorSyncResult.Outcome.FAILED, result.getOutcome());
+        assertTrue(harness.node.isManagedFlowMissingAtStartup());
+        assertEquals("ghost-flow", harness.node.getAuthoritativeManagedProcessGroup().getName());
+    }
+
+    @Test
+    public void testMatchingConnectorBundleStillResolvesPersistedComponentBundle() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.repository.restoreConnector(harness.node);
+        final Bundle available = componentBundle("org.apache.nifi", "processor-nar", "2.0.0");
+        useBundleLookup(harness, List.of(available));
+        final VersionedProcessGroup persisted = componentGroup("persisted", componentBundle("org.apache.nifi", "processor-nar", "1.0.0"));
+
+        harness.repository.syncConnector(versioned(harness.loadedBundle(), persisted, VersionedConnectorState.ENABLED));
+
+        assertFalse(harness.node.isPendingFlowEvolution());
+        assertEquals("2.0.0", persisted.getProcessors().iterator().next().getBundle().getVersion());
+        assertEquals("2.0.0", harness.node.getAuthoritativeManagedProcessGroup().getProcessors().iterator().next().getBundle().getVersion());
+        verify(harness.processGroup).restoreFlowPreservingIdentifiers(flowWithComponentVersion("2.0.0"));
+    }
+
+
+    @Test
+    public void testStopConnectorBeforeDrainTaskPublicationCancelsEvolution() throws Exception {
+        final RecordingConnector connector = new RecordingConnector();
+        final Harness harness = harness(connector, false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final CountDownLatch ghostValidationEntered = new CountDownLatch(1);
+        final CountDownLatch ghostValidationReleased = new CountDownLatch(1);
+        when(harness.processGroup.findAllProcessors()).thenAnswer(invocation -> {
+            if (Thread.currentThread().getName().startsWith("NiFi Connector Flow Evolution Coordinator-")) {
+                ghostValidationEntered.countDown();
+                ghostValidationReleased.await();
+            }
+
+            return List.of();
+        });
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(ghostValidationEntered.await(5, TimeUnit.SECONDS));
+
+        harness.node.cancelDrainFlowFiles();
+        ghostValidationReleased.countDown();
+
+        assertThrows(Exception.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertTrue(harness.node.isPendingFlowEvolution());
+        assertEquals(0, connector.evolutionCalls);
+    }
+
+
+    @Test
+    public void testStopConnectorAfterClaimCancelsBeforeCoordinatorBegin() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final FlowEvolutionRequestReplicator requestReplicator = (FlowEvolutionRequestReplicator) harness.requestReplicator;
+        final CountDownLatch resetEntered = new CountDownLatch(1);
+        final CountDownLatch resetReleased = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            resetEntered.countDown();
+            resetReleased.await();
+            return null;
+        }).when(requestReplicator).resetFlowEvolutionParticipants(anyString());
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(resetEntered.await(5, TimeUnit.SECONDS));
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+        resetReleased.countDown();
+
+        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        stop.get(5, TimeUnit.SECONDS);
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(FlowEvolutionStatus.FAILED, harness.node.getFlowEvolutionStatus());
+        assertEquals(1, harness.componentLog.getErrorMessages().size());
+    }
+
+
+    @Test
+    public void testStartConnectorInterruptsBlockedSaveAtDeadline() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        harness.repository.setFlowEvolutionTimeout(Duration.ofMillis(200));
+        final CountDownLatch saveStarted = new CountDownLatch(1);
+        final AtomicBoolean saveInterrupted = new AtomicBoolean();
+        final AtomicInteger saveCalls = new AtomicInteger();
+        harness.repository.setFlowEvolutionSaveAction(() -> {
+            if (saveCalls.getAndIncrement() > 0) {
+                return;
+            }
+
+            saveStarted.countDown();
+            try {
+                Thread.sleep(60_000);
+            } catch (final InterruptedException e) {
+                saveInterrupted.set(true);
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("save interrupted", e);
+            }
+        });
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(saveStarted.await(5, TimeUnit.SECONDS));
+
+        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        assertTrue(saveInterrupted.get());
+        assertEquals(1, saveCalls.get());
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertFalse(harness.node.isPendingFlowEvolution());
+        assertEquals("2.0.0", harness.node.getActiveFlowContext().getBundle().getVersion());
+    }
+
+    @Test
+    public void testStopConnectorDuringSaveDefersUntilPersistenceCompletes() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final CountDownLatch saveStarted = new CountDownLatch(1);
+        final CountDownLatch saveReleased = new CountDownLatch(1);
+        harness.repository.setFlowEvolutionSaveAction(() -> {
+            saveStarted.countDown();
+            try {
+                saveReleased.await();
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("save interrupted", e);
+            }
+        });
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(saveStarted.await(5, TimeUnit.SECONDS));
+        clearInvocations(harness.lifecycle);
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+
+        assertFalse(stop.isDone());
+        verify(harness.lifecycle, never()).stop();
+        saveReleased.countDown();
+        evolution.get(5, TimeUnit.SECONDS);
+        stop.get(5, TimeUnit.SECONDS);
+        verify(harness.lifecycle, never()).stop();
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertFalse(harness.node.isPendingFlowEvolution());
+    }
+
+
+    @Test
+    public void testStopBeforeEvolutionPersistenceKeepsScheduledStateStopped() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final CountDownLatch persistencePending = new CountDownLatch(1);
+        final CountDownLatch releasePersistence = new CountDownLatch(1);
+        final AtomicBoolean heldPersistence = new AtomicBoolean();
+        final AtomicReference<ConnectorState> desiredAtSave = new AtomicReference<>();
+        final AtomicInteger saveCalls = new AtomicInteger();
+        final FlowEvolutionRequestReplicator requestReplicator = (FlowEvolutionRequestReplicator) harness.requestReplicator;
+        when(requestReplicator.getFlowEvolutionStatus(anyString(), any(Duration.class))).thenAnswer(invocation -> {
+            final FlowEvolutionStatus status = harness.node.getFlowEvolutionStatus();
+            if (status == FlowEvolutionStatus.PERSISTENCE_PENDING && heldPersistence.compareAndSet(false, true)) {
+                persistencePending.countDown();
+                if (!releasePersistence.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("timed out waiting to resume flow evolution persistence");
+                }
+            }
+
+            return harness.node.getFlowEvolutionStatus();
+        });
+        harness.repository.setFlowEvolutionSaveAction(() -> {
+            saveCalls.incrementAndGet();
+            desiredAtSave.set(harness.node.getDesiredState());
+        });
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(persistencePending.await(5, TimeUnit.SECONDS));
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+        releasePersistence.countDown();
+
+        evolution.get(5, TimeUnit.SECONDS);
+        stop.get(5, TimeUnit.SECONDS);
+        assertEquals(1, saveCalls.get());
+        assertEquals(ConnectorState.STOPPED, desiredAtSave.get());
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(ConnectorState.STOPPED, harness.node.getDesiredState());
+    }
+
+    @Test
+    public void testStopDuringEvolutionPersistenceRewritesScheduledStateStopped() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final List<ConnectorState> desiredAtSave = new ArrayList<>();
+        final List<ConnectorState> currentAtSave = new ArrayList<>();
+        final CountDownLatch firstSaveStarted = new CountDownLatch(1);
+        final CountDownLatch releaseFirstSave = new CountDownLatch(1);
+        harness.repository.setFlowEvolutionSaveAction(() -> {
+            desiredAtSave.add(harness.node.getDesiredState());
+            currentAtSave.add(harness.node.getCurrentState());
+            if (desiredAtSave.size() == 1) {
+                firstSaveStarted.countDown();
+                try {
+                    if (!releaseFirstSave.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("timed out waiting to finish the first evolution save");
+                    }
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("interrupted while waiting to finish the first evolution save", e);
+                }
+            }
+        });
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(firstSaveStarted.await(5, TimeUnit.SECONDS));
+        final Future<Void> stop = harness.repository.stopConnector(harness.node);
+        releaseFirstSave.countDown();
+
+        evolution.get(5, TimeUnit.SECONDS);
+        stop.get(5, TimeUnit.SECONDS);
+        assertEquals(List.of(ConnectorState.RUNNING, ConnectorState.STOPPED), desiredAtSave);
+        assertEquals(List.of(ConnectorState.DRAINING, ConnectorState.STOPPED), currentAtSave);
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(ConnectorState.STOPPED, harness.node.getDesiredState());
+    }
+
+
+    @Test
+    public void testFlowEvolutionExecutorStartsConcurrentNonCooperativeHooks() throws Exception {
+        final int evolutionCount = 20;
+        final List<Harness> harnesses = new ArrayList<>();
+        for (int i = 0; i < evolutionCount; i++) {
+            final RecordingConnector connector = new RecordingConnector();
+            connector.block = true;
+            connector.ignoreHookInterrupt = true;
+            final Harness harness = harness(connector, false);
+            harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+            harnesses.add(harness);
+        }
+
+        final StandardConnectorRepository repository = harnesses.getFirst().repository;
+        final FlowEvolutionRequestReplicator requestReplicator = (FlowEvolutionRequestReplicator) harnesses.getFirst().requestReplicator;
+        final CyclicBarrier initialBarrier = new CyclicBarrier(harnesses.size());
+        final AtomicInteger statusRequests = new AtomicInteger();
+        when(requestReplicator.getFlowEvolutionStatus(anyString(), any(Duration.class))).thenAnswer(invocation -> {
+            if (statusRequests.getAndIncrement() < harnesses.size()) {
+                initialBarrier.await(5, TimeUnit.SECONDS);
+            }
+
+            return FlowEvolutionStatus.PHASE_ONE_PENDING;
+        });
+
+        final List<Future<Void>> evolutions = new ArrayList<>();
+        try {
+            for (final Harness harness : harnesses) {
+                evolutions.add(repository.startConnector(harness.node));
+            }
+
+            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            int startedCount;
+            do {
+                startedCount = (int) harnesses.stream().filter(harness -> harness.connector.started.getCount() == 0).count();
+                if (startedCount < evolutionCount) {
+                    Thread.sleep(10);
+                }
+            } while (startedCount < evolutionCount && System.nanoTime() < deadline);
+
+            assertEquals(evolutionCount, startedCount);
+        } finally {
+            for (final Harness harness : harnesses) {
+                harness.node.cancelDrainFlowFiles();
+                harness.connector.hookReleased.countDown();
+            }
+
+            for (final Future<Void> evolution : evolutions) {
+                evolution.cancel(true);
+            }
+
+            repository.shutdown();
+        }
+    }
+
+    @Test
+    public void testStartConnectorLegacyReplicatorUsesLocalStatus() throws Exception {
+        final RecordingConnector connector = new RecordingConnector();
+        connector.block = true;
+        final Harness harness = harness(connector, false, false);
+        harness.node.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+        assertTrue(connector.started.await(5, TimeUnit.SECONDS));
+        harness.node.cancelDrainFlowFiles();
+
+        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertTrue(harness.node.isPendingFlowEvolution());
+    }
+
+
+    @Test
+    public void testStartConnectorPersistenceFailureKeepsCommittedUpgradeStopped() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final VersionedProcessGroup outgoingFlow = flowGroup("pre-upgrade");
+        harness.node.adoptAuthoritativeSnapshot(outgoingFlow, null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final AtomicInteger saveCalls = new AtomicInteger();
+        harness.repository.setFlowEvolutionSaveAction(() -> {
+            if (saveCalls.getAndIncrement() == 0) {
+                throw new IllegalStateException("Expected persistence failure");
+            }
+        });
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+
+        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        assertEquals(1, saveCalls.get());
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(FlowEvolutionStatus.FAILED, harness.node.getFlowEvolutionStatus());
+        assertFalse(harness.node.isPendingFlowEvolution());
+        assertEquals("2.0.0", harness.node.getActiveFlowContext().getBundle().getVersion());
+        assertNotSame(outgoingFlow, harness.node.getAuthoritativeManagedProcessGroup());
+    }
+
+    @Test
+    public void testStartConnectorPeerPersistenceFailureKeepsCommittedUpgradeStopped() throws Exception {
+        final Harness harness = harness(new RecordingConnector(), false);
+        final VersionedProcessGroup outgoingFlow = flowGroup("pre-upgrade");
+        harness.node.adoptAuthoritativeSnapshot(outgoingFlow, null, new Bundle("org.apache.nifi", "test-nar", "1.0.0"));
+        final AtomicInteger saveCalls = new AtomicInteger();
+        harness.repository.setFlowEvolutionSaveAction(saveCalls::incrementAndGet);
+        final FlowEvolutionRequestReplicator requestReplicator = (FlowEvolutionRequestReplicator) harness.requestReplicator;
+        when(requestReplicator.getFlowEvolutionStatus(anyString(), any(Duration.class))).thenAnswer(invocation ->
+            harness.node.getFlowEvolutionStatus() == FlowEvolutionStatus.PERSISTENCE_COMPLETE
+                ? FlowEvolutionStatus.FAILED : harness.node.getFlowEvolutionStatus());
+
+        final Future<Void> evolution = harness.repository.startConnector(harness.node);
+
+        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
+        assertEquals(1, saveCalls.get());
+        assertEquals(ConnectorState.STOPPED, harness.node.getCurrentState());
+        assertEquals(FlowEvolutionStatus.FAILED, harness.node.getFlowEvolutionStatus());
+        assertFalse(harness.node.isPendingFlowEvolution());
+        assertEquals("2.0.0", harness.node.getActiveFlowContext().getBundle().getVersion());
+        assertNotSame(outgoingFlow, harness.node.getAuthoritativeManagedProcessGroup());
+    }
+
+    private static void useBundleLookup(final Harness harness, final List<Bundle> availableBundles) {
+        final ComponentBundleLookup bundleLookup = mock(ComponentBundleLookup.class);
+        when(bundleLookup.getAvailableBundles(anyString())).thenReturn(availableBundles);
+        harness.node.initializeConnector(new StandardConnectorInitializationContext.Builder()
+            .identifier("connector-1")
+            .name("Connector")
+            .componentLog(harness.componentLog)
+            .secretsManager(mock(SecretsManager.class))
+            .assetManager(mock(AssetManager.class))
+            .componentBundleLookup(bundleLookup)
+            .build());
+    }
+
+    private static Bundle componentBundle(final String group, final String artifact, final String version) {
+        final Bundle bundle = new Bundle();
+        bundle.setGroup(group);
+        bundle.setArtifact(artifact);
+        bundle.setVersion(version);
+        return bundle;
+    }
+
+    private static VersionedProcessGroup componentGroup(final String name, final Bundle bundle) {
+        final VersionedProcessor processor = new VersionedProcessor();
+        processor.setIdentifier("processor-1");
+        processor.setName("Generate");
+        processor.setType("org.example.Generate");
+        processor.setBundle(bundle);
+        processor.setComponentType(ComponentType.PROCESSOR);
+
+        final VersionedControllerService service = new VersionedControllerService();
+        service.setIdentifier("service-1");
+        service.setName("Service");
+        service.setType("org.example.Service");
+        service.setBundle(new Bundle(bundle.getGroup(), bundle.getArtifact(), bundle.getVersion()));
+        service.setComponentType(ComponentType.CONTROLLER_SERVICE);
+
+        final VersionedProcessGroup group = flowGroup(name);
+        group.setProcessors(new HashSet<>(Set.of(processor)));
+        group.setControllerServices(new HashSet<>(Set.of(service)));
+        return group;
+    }
+
+    private static VersionedExternalFlow flowWithComponentVersion(final String version) {
+        return argThat(flow -> flow != null && flow.getFlowContents() != null
+            && version.equals(flow.getFlowContents().getProcessors().iterator().next().getBundle().getVersion()));
     }
 
     private static class MigratingConnector extends TrackingConnector {

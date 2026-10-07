@@ -20,6 +20,9 @@ package org.apache.nifi.tests.system.connectors;
 import jakarta.ws.rs.WebApplicationException;
 import org.apache.nifi.components.connector.ConnectorState;
 import org.apache.nifi.controller.ScheduledState;
+import org.apache.nifi.flow.VersionedConnector;
+import org.apache.nifi.flow.VersionedProcessor;
+import org.apache.nifi.tests.system.FlowDefinitionFiles;
 import org.apache.nifi.tests.system.NiFiSystemIT;
 import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.apache.nifi.web.api.dto.AssetReferenceDTO;
@@ -939,6 +942,62 @@ public class ConnectorTroubleshootingIT extends NiFiSystemIT {
         runManagedFlowAndAssertParameterValues(connectorId, sensitiveOutputFile, assetOutputFile, sensitiveSecretValue, assetFileContent, "after restart");
     }
 
+    @Test
+    public void testAuthoritativeSnapshotPreservesManagedParametersAfterRestart() throws NiFiClientException, IOException, InterruptedException {
+        final String secretName = "authoritativeSnapshotSecret";
+        final String sensitiveSecretValue = "authoritative-snapshot-secret-value";
+        final String assetFileContent = "Hello, World!";
+        final File sensitiveOutputFile = new File("target/authoritative-snapshot-sensitive.txt");
+        final File assetOutputFile = new File("target/authoritative-snapshot-asset.txt");
+        sensitiveOutputFile.delete();
+        assetOutputFile.delete();
+
+        final ParameterProviderEntity parameterProvider = getClientUtil().createParameterProvider("PropertiesParameterProvider");
+        getClientUtil().updateParameterProviderProperties(parameterProvider, Map.of("parameters", secretName + "=" + sensitiveSecretValue));
+
+        final ConnectorEntity connector = getClientUtil().createConnector("ParameterContextConnector");
+        final String connectorId = connector.getId();
+        final File assetFile = new File("src/test/resources/sample-assets/helloworld.txt");
+        final AssetEntity assetEntity = getNifiClient().getConnectorClient().createAsset(connectorId, assetFile.getName(), assetFile);
+        final String uploadedAssetId = assetEntity.getAsset().getId();
+
+        final ConnectorValueReferenceDTO secretReference = getClientUtil().createSecretValueReference(
+            parameterProvider.getId(), secretName, "PropertiesParameterProvider.Parameters." + secretName);
+        final ConnectorValueReferenceDTO assetReference = new ConnectorValueReferenceDTO();
+        assetReference.setValueType("ASSET_REFERENCE");
+        assetReference.setAssetReferences(List.of(new AssetReferenceDTO(uploadedAssetId)));
+
+        final Map<String, ConnectorValueReferenceDTO> propertyValues = new HashMap<>();
+        propertyValues.put("Sensitive Value", secretReference);
+        propertyValues.put("Asset File", assetReference);
+        propertyValues.put("Sensitive Output File", createStringLiteralRef(sensitiveOutputFile.getAbsolutePath()));
+        propertyValues.put("Asset Output File", createStringLiteralRef(assetOutputFile.getAbsolutePath()));
+
+        getClientUtil().configureConnectorWithReferences(connectorId, "Parameter Context Configuration", propertyValues);
+        getClientUtil().applyConnectorUpdate(connector);
+        getClientUtil().waitForValidConnector(connectorId);
+        getClientUtil().startConnector(connectorId);
+        waitFor(() -> sensitiveOutputFile.exists() && assetOutputFile.exists());
+        getClientUtil().stopConnector(connectorId);
+
+        assertTrue(sensitiveOutputFile.delete() || !sensitiveOutputFile.exists());
+        assertTrue(assetOutputFile.delete() || !assetOutputFile.exists());
+        getNiFiInstance().stop();
+        final String persistedSensitive = FlowDefinitionFiles.parameterValue(getNiFiInstance(), "sensitive_param");
+        assertNotNull(persistedSensitive);
+        assertTrue(persistedSensitive.startsWith("enc{"), persistedSensitive);
+        assertFalse(persistedSensitive.contains(sensitiveSecretValue), persistedSensitive);
+        getNiFiInstance().start();
+        if (getNiFiInstance().isClustered()) {
+            waitForAllNodesConnected();
+        }
+
+        getClientUtil().startConnector(connectorId);
+        waitFor(() -> sensitiveOutputFile.exists() && assetOutputFile.exists());
+        assertEquals(sensitiveSecretValue, Files.readString(sensitiveOutputFile.toPath()).trim());
+        assertEquals(assetFileContent, Files.readString(assetOutputFile.toPath()).trim());
+    }
+
     /**
      * Verify that a Connector's configured active configuration survives a NiFi restart while the Connector is in
      * Troubleshooting mode, and that flow modifications made during Troubleshooting are discarded once
@@ -1237,6 +1296,97 @@ public class ConnectorTroubleshootingIT extends NiFiSystemIT {
         for (final ProcessGroupEntity child : flow.getProcessGroups()) {
             collectPorts(connectorId, child.getId(), input, collected);
         }
+    }
+
+    @Test
+    public void testTroubleshootingEditsRestoredAfterRestart() throws NiFiClientException, IOException, InterruptedException {
+        final ConnectorEntity connector = getClientUtil().createConnector("ComponentLifecycleConnector");
+        final String connectorId = connector.getId();
+        getClientUtil().applyConnectorUpdate(connector);
+        getClientUtil().waitForValidConnector(connectorId);
+        getClientUtil().enterTroubleshooting(connectorId);
+
+        ProcessorEntity generate = findRootProcessor(connectorId, "Root GenerateFlowFile");
+        generate = getClientUtil().updateProcessorSchedulingPeriod(generate, "1 hour");
+        getClientUtil().startProcessor(generate);
+
+        getNiFiInstance().stop();
+        getNiFiInstance().start(true);
+        if (getNumberOfNodes() > 1) {
+            waitForAllNodesConnected();
+        }
+
+        assertConnectorState(connectorId, ConnectorState.TROUBLESHOOTING);
+        generate = findRootProcessor(connectorId, "Root GenerateFlowFile");
+        assertEquals("1 hour", generate.getComponent().getConfig().getSchedulingPeriod());
+        assertEquals(ScheduledState.RUNNING.name(), generate.getComponent().getState());
+
+        getNiFiInstance().stop();
+        getNiFiInstance().start(true);
+        if (getNumberOfNodes() > 1) {
+            waitForAllNodesConnected();
+        }
+        getNiFiInstance().stop();
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(flowNode(), connectorId);
+        assertEquals("1 hour", versionedProcessor(persisted.getManagedProcessGroup(), "Root GenerateFlowFile").getSchedulingPeriod());
+        getNiFiInstance().start(true);
+        if (getNumberOfNodes() > 1) {
+            waitForAllNodesConnected();
+        }
+
+        stopAllManagedComponents(connectorId);
+        getClientUtil().endTroubleshooting(connectorId);
+        assertConnectorState(connectorId, ConnectorState.STOPPED);
+        generate = findRootProcessor(connectorId, "Root GenerateFlowFile");
+        assertEquals("10 sec", generate.getComponent().getConfig().getSchedulingPeriod());
+
+        getNiFiInstance().stop();
+        final VersionedConnector restored = FlowDefinitionFiles.readConnector(flowNode(), connectorId);
+        assertNotNull(restored.getManagedProcessGroup());
+        assertEquals("10 sec", versionedProcessor(restored.getManagedProcessGroup(), "Root GenerateFlowFile").getSchedulingPeriod());
+        getNiFiInstance().start(true);
+    }
+
+    @Test
+    public void testTroubleshootingEditsPersistedInManagedProcessGroup() throws NiFiClientException, IOException, InterruptedException {
+        final ConnectorEntity connector = getClientUtil().createConnector("ComponentLifecycleConnector");
+        final String connectorId = connector.getId();
+        getClientUtil().applyConnectorUpdate(connector);
+        getClientUtil().waitForValidConnector(connectorId);
+        getClientUtil().enterTroubleshooting(connectorId);
+        getClientUtil().updateProcessorSchedulingPeriod(findRootProcessor(connectorId, "Root GenerateFlowFile"), "1 hour");
+
+        getNiFiInstance().stop();
+        getNiFiInstance().start(true);
+        if (getNumberOfNodes() > 1) {
+            waitForAllNodesConnected();
+        }
+        getNiFiInstance().stop();
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(flowNode(), connectorId);
+        assertEquals("1 hour", versionedProcessor(persisted.getManagedProcessGroup(), "Root GenerateFlowFile").getSchedulingPeriod());
+        getNiFiInstance().start(true);
+    }
+
+    private org.apache.nifi.tests.system.NiFiInstance flowNode() {
+        return getNumberOfNodes() <= 1 ? getNiFiInstance() : getNiFiInstance().getNodeInstance(1);
+    }
+
+    private ProcessorEntity findRootProcessor(final String connectorId, final String name) throws NiFiClientException, IOException {
+        for (final ProcessorEntity processor : getNifiClient().getConnectorClient().getFlow(connectorId).getProcessGroupFlow().getFlow().getProcessors()) {
+            if (name.equals(processor.getComponent().getName())) {
+                return processor;
+            }
+        }
+        throw new IllegalStateException("No processor named " + name);
+    }
+
+    private VersionedProcessor versionedProcessor(final org.apache.nifi.flow.VersionedProcessGroup group, final String name) {
+        for (final VersionedProcessor processor : group.getProcessors()) {
+            if (name.equals(processor.getName())) {
+                return processor;
+            }
+        }
+        throw new IllegalStateException("No versioned processor named " + name);
     }
 
     private ConnectorValueReferenceDTO createStringLiteralRef(final String value) {

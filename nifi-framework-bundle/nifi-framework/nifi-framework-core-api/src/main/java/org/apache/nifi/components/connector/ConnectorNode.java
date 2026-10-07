@@ -31,6 +31,8 @@ import org.apache.nifi.connectable.FlowFileTransferCounts;
 import org.apache.nifi.engine.FlowEngine;
 import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.VersionedConfigurationStep;
+import org.apache.nifi.flow.VersionedParameterContext;
+import org.apache.nifi.flow.VersionedProcessGroup;
 import org.apache.nifi.logging.ComponentLog;
 
 import java.time.Duration;
@@ -191,6 +193,50 @@ public interface ConnectorNode extends ComponentAuthorizable, VersionedComponent
     FrameworkFlowContext getActiveFlowContext();
 
     FrameworkFlowContext getWorkingFlowContext();
+
+    /**
+     * @return true when the Connector is not ghosted ({@link #isExtensionMissing()} is false), an authoritative snapshot
+     *         is held, and its bundle differs from {@link #getBundleCoordinate()}. While true, Apply is rejected and
+     *         START waits for the Future returned by {@link Connector#prepareForFlowEvolution(FlowEvolutionContext)}
+     *         before installing the upgraded flow.
+     */
+    boolean isPendingFlowEvolution();
+
+    /**
+     * @return local progress through the pending flow evolution
+     */
+    default FlowEvolutionStatus getFlowEvolutionStatus() {
+        return FlowEvolutionStatus.INACTIVE;
+    }
+
+    /**
+     * @return the last authoritative applied flow, or null when none is held. None is held after a legacy
+     *         troubleshooting load, until troubleshooting is exited.
+     */
+    VersionedProcessGroup getAuthoritativeManagedProcessGroup();
+
+    /**
+     * @return the parameter context that belonged to the authoritative flow, or null
+     */
+    VersionedParameterContext getAuthoritativeParameterContext();
+
+    /**
+     * Returns the authoritative flow, parameters, bundle, and active configuration as one persistence snapshot.
+     * Implementations that mutate these values during an update should override this method to return an atomically
+     * published snapshot.
+     *
+     * @return authoritative persistence snapshot, or null when none is held
+     */
+    default ConnectorFlowSnapshot getAuthoritativeFlowSnapshot() {
+        final VersionedProcessGroup flow = getAuthoritativeManagedProcessGroup();
+        if (flow == null) {
+            return null;
+        }
+
+        final FrameworkFlowContext activeContext = getActiveFlowContext();
+        return new ConnectorFlowSnapshot(flow, getAuthoritativeParameterContext(), activeContext.getBundle(),
+                activeContext.getConfigurationContext().toConnectorConfiguration());
+    }
 
     void discardWorkingConfiguration();
 

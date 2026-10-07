@@ -43,6 +43,9 @@ import org.apache.nifi.authorization.user.StandardNiFiUser.Builder;
 import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.bundle.BundleDetails;
+import org.apache.nifi.cluster.coordination.ClusterCoordinator;
+import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
+import org.apache.nifi.cluster.protocol.NodeIdentifier;
 import org.apache.nifi.components.Backlog;
 import org.apache.nifi.components.BacklogReportingException;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -137,6 +140,7 @@ import org.apache.nifi.validation.RuleViolationsManager;
 import org.apache.nifi.web.api.dto.AffectedComponentDTO;
 import org.apache.nifi.web.api.dto.BacklogDTO;
 import org.apache.nifi.web.api.dto.BulletinBoardDTO;
+import org.apache.nifi.web.api.dto.BulletinDTO;
 import org.apache.nifi.web.api.dto.BulletinQueryDTO;
 import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.ComponentStateDTO;
@@ -197,6 +201,8 @@ import org.apache.nifi.web.revision.UpdateRevisionTask;
 import org.apache.nifi.web.security.token.NiFiAuthenticationToken;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.stubbing.Answer;
@@ -2465,8 +2471,93 @@ public class StandardNiFiServiceFacadeTest {
         verify(connectorNode).verifyCanReload();
     }
 
+    @ParameterizedTest
+    @EnumSource(value = NodeConnectionState.class, names = {"CONNECTING", "DISCONNECTING", "DISCONNECTED", "OFFLOADING", "OFFLOADED"})
+    public void testVerifyUpdateConnectorRejectsVersionChangeWithUnconnectedNode(final NodeConnectionState unconnectedState) {
+        final String connectorId = "connector-id";
+        final BundleCoordinate existingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        final BundleCoordinate incomingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "2.0.0");
+        final ConnectorNode connectorNode = configureConnectorForBundleUpdate(connectorId, "org.apache.nifi.connectors.TestConnector", existingCoordinate, incomingCoordinate);
+        final NodeIdentifier unconnectedNode = configureClusterWithUnconnectedNode(unconnectedState, true);
+
+        final ConnectorDTO connectorDTO = new ConnectorDTO();
+        connectorDTO.setId(connectorId);
+        connectorDTO.setBundle(new BundleDTO(incomingCoordinate.getGroup(), incomingCoordinate.getId(), incomingCoordinate.getVersion()));
+
+        final IllegalStateException exception = assertThrows(IllegalStateException.class, () -> serviceFacade.verifyUpdateConnector(connectorDTO));
+
+        assertTrue(exception.getMessage().contains(unconnectedNode.toString()));
+        verify(connectorNode, never()).verifyCanReload();
+    }
+
     @Test
-    public void testGetConnectorClusterNodeRequest() {
+    public void testVerifyUpdateConnectorRejectsVersionChangeOnDisconnectedLocalNode() {
+        final String connectorId = "connector-id";
+        final BundleCoordinate existingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        final BundleCoordinate incomingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "2.0.0");
+        configureConnectorForBundleUpdate(connectorId, "org.apache.nifi.connectors.TestConnector", existingCoordinate, incomingCoordinate);
+        final ClusterCoordinator clusterCoordinator = mock(ClusterCoordinator.class);
+        when(clusterCoordinator.isConnected()).thenReturn(false);
+        when(clusterCoordinator.getConnectionStates()).thenReturn(Map.of());
+        serviceFacade.setClusterCoordinator(clusterCoordinator);
+
+        final ConnectorDTO connectorDTO = new ConnectorDTO();
+        connectorDTO.setId(connectorId);
+        connectorDTO.setBundle(new BundleDTO(incomingCoordinate.getGroup(), incomingCoordinate.getId(), incomingCoordinate.getVersion()));
+
+        assertThrows(IllegalStateException.class, () -> serviceFacade.verifyUpdateConnector(connectorDTO));
+    }
+
+    @Test
+    public void testVerifyUpdateConnectorAllowsRenameWithUnconnectedNode() {
+        final String connectorId = "connector-id";
+        final BundleCoordinate coordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        configureConnectorForBundleUpdate(connectorId, "org.apache.nifi.connectors.TestConnector", coordinate, coordinate);
+        configureClusterWithUnconnectedNode(NodeConnectionState.DISCONNECTED, true);
+
+        final ConnectorDTO connectorDTO = new ConnectorDTO();
+        connectorDTO.setId(connectorId);
+        connectorDTO.setName("Renamed Connector");
+        connectorDTO.setBundle(new BundleDTO(coordinate.getGroup(), coordinate.getId(), coordinate.getVersion()));
+
+        serviceFacade.verifyUpdateConnector(connectorDTO);
+    }
+
+    private NodeIdentifier configureClusterWithUnconnectedNode(final NodeConnectionState unconnectedState, final boolean localNodeConnected) {
+        final NodeIdentifier connectedNode = new NodeIdentifier("node-1", "node-1.example.com", 8443, "node-1.example.com", 9999, null, null, null, false);
+        final NodeIdentifier unconnectedNode = new NodeIdentifier("node-2", "node-2.example.com", 8443, "node-2.example.com", 9999, null, null, null, false);
+        final ClusterCoordinator clusterCoordinator = mock(ClusterCoordinator.class);
+        when(clusterCoordinator.isConnected()).thenReturn(localNodeConnected);
+        when(clusterCoordinator.getConnectionStates()).thenReturn(Map.of(
+            NodeConnectionState.CONNECTED, List.of(connectedNode),
+            unconnectedState, List.of(unconnectedNode)));
+        serviceFacade.setClusterCoordinator(clusterCoordinator);
+        return unconnectedNode;
+    }
+
+    @Test
+    public void testVerifyRunStatusDoesNotLoadProviderConfiguration() {
+        final String connectorId = "connector-id";
+        final ConnectorDAO connectorDAO = mock(ConnectorDAO.class);
+        serviceFacade.setConnectorDAO(connectorDAO);
+
+        final ConnectorNode connectorNode = mock(ConnectorNode.class);
+        when(connectorDAO.getConnector(connectorId, ConnectorSyncMode.LOCAL_ONLY)).thenReturn(connectorNode);
+        when(connectorNode.getCurrentState()).thenReturn(ConnectorState.STOPPED);
+
+        final ConnectorDTO connectorDTO = new ConnectorDTO();
+        connectorDTO.setId(connectorId);
+        connectorDTO.setState("RUNNING");
+
+        serviceFacade.verifyUpdateConnector(connectorDTO);
+
+        verify(connectorDAO).getConnector(connectorId, ConnectorSyncMode.LOCAL_ONLY);
+        verify(connectorDAO, never()).getConnector(connectorId);
+        verify(connectorNode).verifyCanStart();
+    }
+
+    @Test
+    public void testGetConnectorClusterNodeRequestIncludesBulletins() {
         final String connectorId = "connector-id";
         final String managedGroupId = "managed-group-id";
 
@@ -2474,11 +2565,13 @@ public class StandardNiFiServiceFacadeTest {
         final DtoFactory dtoFactory = mock(DtoFactory.class);
         final RevisionManager revisionManager = mock(RevisionManager.class);
         final ControllerFacade controllerFacade = mock(ControllerFacade.class);
+        final BulletinRepository bulletinRepository = mock(BulletinRepository.class);
         serviceFacade.setConnectorDAO(connectorDAO);
         serviceFacade.setDtoFactory(dtoFactory);
         serviceFacade.setRevisionManager(revisionManager);
         serviceFacade.setEntityFactory(new EntityFactory());
         serviceFacade.setControllerFacade(controllerFacade);
+        serviceFacade.setBulletinRepository(bulletinRepository);
 
         final ConnectorNode connectorNode = mock(ConnectorNode.class);
         final FrameworkFlowContext flowContext = mock(FrameworkFlowContext.class);
@@ -2502,6 +2595,12 @@ public class StandardNiFiServiceFacadeTest {
         when(dtoFactory.createRevisionDTO(any(Revision.class))).thenReturn(revisionDTO);
         when(revisionManager.getRevision(connectorId)).thenReturn(new Revision(1L, null, connectorId));
 
+        final Bulletin bulletin = mock(Bulletin.class);
+        final BulletinDTO bulletinDTO = new BulletinDTO();
+        bulletinDTO.setSourceId(connectorId);
+        when(bulletinRepository.findBulletinsForSource(connectorId)).thenReturn(List.of(bulletin));
+        when(dtoFactory.createBulletinDtos(List.of(bulletin))).thenReturn(List.of(bulletinDTO));
+
         final ConnectorEntity entity = serviceFacade.getConnector(connectorId, true);
 
         assertNotNull(entity);
@@ -2510,6 +2609,9 @@ public class StandardNiFiServiceFacadeTest {
         assertFalse(entity.getPermissions().getCanWrite());
         assertNotNull(entity.getComponent(), "Component should be populated when clusterNodeRequest is true");
         assertEquals("RUNNING", entity.getComponent().getState());
+        assertEquals(1, entity.getBulletins().size());
+        assertEquals(bulletinDTO, entity.getBulletins().getFirst().getBulletin());
+        verify(bulletinRepository).findBulletinsForSource(connectorId);
     }
 
     @Test
@@ -3674,7 +3776,7 @@ public class StandardNiFiServiceFacadeTest {
         serviceFacade.setConnectorDAO(connectorDAO);
 
         final ConnectorNode connectorNode = mock(ConnectorNode.class);
-        when(connectorDAO.getConnector(connectorId)).thenReturn(connectorNode);
+        when(connectorDAO.getConnector(connectorId, ConnectorSyncMode.LOCAL_ONLY)).thenReturn(connectorNode);
         when(connectorNode.getCurrentState()).thenReturn(ConnectorState.STOPPED);
         when(connectorNode.getCanonicalClassName()).thenReturn(type);
         when(connectorNode.getBundleCoordinate()).thenReturn(existingCoordinate);

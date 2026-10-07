@@ -46,6 +46,7 @@ import org.apache.nifi.cluster.protocol.message.OffloadMessage;
 import org.apache.nifi.cluster.protocol.message.ProtocolMessage;
 import org.apache.nifi.cluster.protocol.message.ReconnectionRequestMessage;
 import org.apache.nifi.cluster.protocol.message.ReconnectionResponseMessage;
+import org.apache.nifi.components.connector.StandardConnectorRepository;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.connectable.Connection;
@@ -245,6 +246,16 @@ public class StandardFlowService implements FlowService, ProtocolHandler {
         } else {
             this.configuredForClustering = false;
             this.senderListener = null;
+        }
+
+        if (controller.getConnectorRepository() instanceof final StandardConnectorRepository connectorRepository) {
+            connectorRepository.setFlowEvolutionSaveAction(() -> {
+                try {
+                    saveFlowChanges();
+                } catch (final IOException e) {
+                    throw new IllegalStateException("Failed to persist the flow after connector flow evolution", e);
+                }
+            });
         }
     }
 

@@ -32,3 +32,5 @@ org.apache.nifi.connectors.tests.system.NonMigratingConnector
 org.apache.nifi.connectors.tests.system.NopConnector
 org.apache.nifi.connectors.tests.system.ParameterContextConnector
 org.apache.nifi.connectors.tests.system.SelectiveDropConnector
+org.apache.nifi.connectors.tests.system.UpgradeDrainConnector
+org.apache.nifi.connectors.tests.system.UpgradeOnlyV1Connector

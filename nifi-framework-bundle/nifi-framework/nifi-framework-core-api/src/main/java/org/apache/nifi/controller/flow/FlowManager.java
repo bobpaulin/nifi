@@ -32,6 +32,7 @@ import org.apache.nifi.controller.flowanalysis.FlowAnalyzer;
 import org.apache.nifi.controller.label.Label;
 import org.apache.nifi.controller.parameter.ParameterProviderLookup;
 import org.apache.nifi.controller.service.ControllerServiceNode;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.flowfile.FlowFilePrioritizer;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.groups.RemoteProcessGroup;
@@ -40,6 +41,7 @@ import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.parameter.ParameterContextManager;
 import org.apache.nifi.parameter.ParameterProviderConfiguration;
 import org.apache.nifi.registry.flow.FlowRegistryClientNode;
+import org.apache.nifi.security.encryption.PropertyEncryptionProvider;
 import org.apache.nifi.validation.RuleViolationsManager;
 import org.apache.nifi.web.api.dto.FlowSnippetDTO;
 
@@ -52,6 +54,21 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 public interface FlowManager extends ParameterProviderLookup {
+
+    /**
+     * @return the controller service provider used to map flows, or null when this manager does not have one
+     */
+    default ControllerServiceProvider getControllerServiceProvider() {
+        return null;
+    }
+
+    /**
+     * @return the provider used to encrypt sensitive values in persisted flows, or null when unavailable
+     */
+    default PropertyEncryptionProvider getPropertyEncryptionProvider() {
+        return null;
+    }
+
     String ROOT_GROUP_ID_ALIAS = "root";
     String DEFAULT_ROOT_GROUP_NAME = "NiFi Flow";
 

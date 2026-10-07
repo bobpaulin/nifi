@@ -97,6 +97,7 @@ import org.apache.nifi.remote.StandardRemoteProcessGroup;
 import org.apache.nifi.remote.TransferDirection;
 import org.apache.nifi.reporting.BulletinRepository;
 import org.apache.nifi.reporting.ReportingTask;
+import org.apache.nifi.security.encryption.PropertyEncryptionProvider;
 import org.apache.nifi.util.FormatUtils;
 import org.apache.nifi.util.NiFiProperties;
 import org.apache.nifi.util.ReflectionUtils;
@@ -814,6 +815,16 @@ public class StandardFlowManager extends AbstractFlowManager implements FlowMana
     @Override
     public List<ConnectorNode> getAllConnectors() {
         return flowController.getConnectorRepository().getConnectors(ConnectorSyncMode.LOCAL_ONLY);
+    }
+
+    @Override
+    public ControllerServiceProvider getControllerServiceProvider() {
+        return flowController.getControllerServiceProvider();
+    }
+
+    @Override
+    public PropertyEncryptionProvider getPropertyEncryptionProvider() {
+        return flowController.getPropertyEncryptionProvider();
     }
 
     @Override

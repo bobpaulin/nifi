@@ -14,3 +14,4 @@
 # limitations under the License.
 
 org.apache.nifi.connectors.tests.system.MigratePropertiesConnector
+org.apache.nifi.connectors.tests.system.UpgradeDrainConnector

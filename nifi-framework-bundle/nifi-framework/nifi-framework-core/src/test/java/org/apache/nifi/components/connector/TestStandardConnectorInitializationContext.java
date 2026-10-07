@@ -155,6 +155,23 @@ public class TestStandardConnectorInitializationContext {
     }
 
     @Test
+    public void testPublicResolveBundlesUsesResolveBundle() {
+        final Bundle unavailableBundle = createBundle("org.apache.nifi", "nifi-standard-nar", "0.0.0-NONEXISTENT");
+        final Bundle availableBundle = createBundle("org.apache.nifi", "nifi-standard-nar", "2.0.0");
+
+        final ComponentBundleLookup bundleLookup = mock(ComponentBundleLookup.class);
+        when(bundleLookup.getAvailableBundles("org.apache.nifi.processors.standard.GenerateFlowFile")).thenReturn(List.of(availableBundle));
+
+        final VersionedProcessGroup group = createProcessGroupWithProcessor("GenerateFlowFile",
+            "org.apache.nifi.processors.standard.GenerateFlowFile", unavailableBundle);
+        final FrameworkConnectorInitializationContext context = createContext(bundleLookup);
+
+        context.resolveBundles(group, BundleCompatibility.RESOLVE_BUNDLE);
+
+        assertEquals("2.0.0", group.getProcessors().iterator().next().getBundle().getVersion());
+    }
+
+    @Test
     public void testResolveBundlesRequireExactBundle() {
         final Bundle unavailableBundle = createBundle("org.apache.nifi", "nifi-standard-nar", "0.0.0-NONEXISTENT");
         final Bundle availableBundle = createBundle("org.apache.nifi", "nifi-standard-nar", "2.0.0");

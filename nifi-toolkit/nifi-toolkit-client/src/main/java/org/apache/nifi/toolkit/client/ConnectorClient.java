@@ -97,6 +97,16 @@ public interface ConnectorClient {
     ConnectorEntity deleteConnector(ConnectorEntity connectorEntity) throws NiFiClientException, IOException;
 
     /**
+     * Discards the connector's working configuration and reverts it to the last applied configuration.
+     *
+     * @param connectorEntity the connector whose working configuration should be discarded
+     * @return the connector after the working configuration is discarded
+     * @throws NiFiClientException if an error occurs during the request
+     * @throws IOException if an I/O error occurs
+     */
+    ConnectorEntity discardConnectorUpdate(ConnectorEntity connectorEntity) throws NiFiClientException, IOException;
+
+    /**
      * Starts a connector.
      *
      * @param connectorId the connector ID
