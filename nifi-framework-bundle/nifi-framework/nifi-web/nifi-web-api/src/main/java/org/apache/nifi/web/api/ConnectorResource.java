@@ -42,10 +42,8 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
-import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.StreamingOutput;
-import jakarta.ws.rs.core.UriBuilder;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.nifi.asset.Asset;
@@ -63,7 +61,6 @@ import org.apache.nifi.cluster.coordination.http.replication.RequestReplicationH
 import org.apache.nifi.cluster.coordination.http.replication.UploadRequest;
 import org.apache.nifi.cluster.coordination.http.replication.UploadRequestReplicator;
 import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
-import org.apache.nifi.cluster.manager.ConnectorEntityMerger;
 import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
 import org.apache.nifi.controller.ScheduledState;
@@ -90,7 +87,6 @@ import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.ComponentStateDTO;
 import org.apache.nifi.web.api.dto.ConfigVerificationResultDTO;
 import org.apache.nifi.web.api.dto.ConfigurationStepConfigurationDTO;
-import org.apache.nifi.web.api.dto.ConnectorActionDTO;
 import org.apache.nifi.web.api.dto.ConnectorDTO;
 import org.apache.nifi.web.api.dto.DropRequestDTO;
 import org.apache.nifi.web.api.dto.MigrationPayloadDTO;
@@ -701,7 +697,7 @@ public class ConnectorResource extends ApplicationResource {
 
         if (isReplicateRequest()) {
             if (ScheduledState.RUNNING.name().equals(requestRunStatus.getState()) && getReplicationTarget() == ReplicationTarget.CLUSTER_NODES) {
-                verifyClusterLoadsSameBundle();
+                populateExpectedBundle(id, requestRunStatus);
             }
             return replicate(HttpMethod.PUT, requestRunStatus);
         } else if (isDisconnectedFromCluster()) {
@@ -720,7 +716,7 @@ public class ConnectorResource extends ApplicationResource {
                     final Authorizable connector = lookup.getConnector(id);
                     OperationAuthorizable.authorizeOperation(connector, authorizer, user);
                 },
-                () -> serviceFacade.verifyUpdateConnector(createDTOWithDesiredRunStatus(id, requestRunStatus.getState())),
+                () -> serviceFacade.verifyUpdateConnector(createDTOWithDesiredRunStatus(id, requestRunStatus.getState(), requestRunStatus.getExpectedBundle())),
                 (revision, runStatusEntity) -> {
                     // update the connector
                     final ScheduledState scheduledState = ScheduledState.valueOf(runStatusEntity.getState());
@@ -733,33 +729,16 @@ public class ConnectorResource extends ApplicationResource {
     }
 
     /**
-     * Each node verifies a START against its own Connector only, so the merged Connector entity is consulted to reject a START
-     * while the nodes load different Connector versions.
+     * Fills the coordinator's loaded bundle onto the run-status request so each node can reject a START in the
+     * validation phase when its own loaded bundle differs. Avoids an extra replicated GET.
      */
-    private void verifyClusterLoadsSameBundle() {
-        final URI runStatusUri = getAbsolutePath();
-        final String runStatusPath = runStatusUri.getPath();
-        final URI connectorUri = UriBuilder.fromUri(runStatusUri).replacePath(runStatusPath.substring(0, runStatusPath.lastIndexOf('/'))).build();
-
-        final NodeResponse nodeResponse;
-        try {
-            nodeResponse = replicateNodeResponse(connectorUri, HttpMethod.GET, new MultivaluedHashMap<>(), null);
-        } catch (final InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while verifying the Connector version on each cluster node", e);
-        }
-
-        if (!(nodeResponse.getUpdatedEntity() instanceof final ConnectorEntity connectorEntity) || connectorEntity.getComponent() == null
-                || connectorEntity.getComponent().getAvailableActions() == null) {
+    private void populateExpectedBundle(final String connectorId, final ConnectorRunStatusEntity requestRunStatus) {
+        final ConnectorEntity localConnector = serviceFacade.getConnector(connectorId);
+        if (localConnector == null || localConnector.getComponent() == null || localConnector.getComponent().getBundle() == null) {
             return;
         }
 
-        for (final ConnectorActionDTO action : connectorEntity.getComponent().getAvailableActions()) {
-            final String reason = action.getReasonNotAllowed();
-            if (reason != null && reason.startsWith(ConnectorEntityMerger.LOADED_BUNDLE_MISMATCH_REASON)) {
-                throw new IllegalStateException("Cannot start Connector " + connectorEntity.getId() + ". " + reason);
-            }
-        }
+        requestRunStatus.setExpectedBundle(localConnector.getComponent().getBundle());
     }
 
     /**
@@ -1830,10 +1809,11 @@ public class ConnectorResource extends ApplicationResource {
         return noCache(Response.ok(entity)).build();
     }
 
-    private ConnectorDTO createDTOWithDesiredRunStatus(final String id, final String runStatus) {
+    private ConnectorDTO createDTOWithDesiredRunStatus(final String id, final String runStatus, final BundleDTO expectedBundle) {
         final ConnectorDTO dto = new ConnectorDTO();
         dto.setId(id);
         dto.setState(runStatus);
+        dto.setExpectedBundle(expectedBundle);
         return dto;
     }
 

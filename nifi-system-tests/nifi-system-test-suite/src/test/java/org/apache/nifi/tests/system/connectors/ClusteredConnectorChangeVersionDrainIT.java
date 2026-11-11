@@ -29,9 +29,7 @@ import org.apache.nifi.web.api.entity.ProcessGroupStatusEntity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -61,15 +59,14 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         waitForNodeConnectorState(1, connectorId, ConnectorState.DRAINING);
         waitForNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
 
-        createGate(1);
-        waitForNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.PHASE_ONE_COMPLETE);
-        assertNodeRemainsBeforePhaseTwo(1, connectorId);
+        releaseFlowFiles(1);
+        waitForNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
+        assertNodeWaitsAtDrainBarrier(1, connectorId);
         assertNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
         assertNodeConnectionPresent(2, connectorId);
-        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.PHASE_ONE_PENDING);
+        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
 
-        createGate(2);
-        waitForNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.PHASE_ONE_COMPLETE);
+        releaseFlowFiles(2);
         waitForNodeConnectorState(1, connectorId, ConnectorState.RUNNING);
         waitForNodeConnectorState(2, connectorId, ConnectorState.RUNNING);
         assertNodeConnectionRemoved(1, connectorId);
@@ -80,14 +77,14 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
 
     @Test
     @Timeout(300)
-    public void testNodeLocalFailureKeepsBothStoppedBeforePhaseTwo() throws Exception {
+    public void testNodeLocalFailureKeepsBothStoppedAtDrainBarrier() throws Exception {
         final String connectorId = createOutgoingConnector("NO_OP", true, null);
-        deleteGates();
+        holdFlowFiles();
         getClientUtil().startConnector(connectorId);
         waitForConnectorMinQueueCount(connectorId, 1);
-        // Gate only node 1 so its generator stops while TerminateFlowFile, already running with the connector, empties
+        // Release only node 1 so its generator stops while TerminateFlowFile, already running with the connector, empties
         // that node. Node 2 keeps generating. The status API aggregates every node, so read each node without replication.
-        createGate(1);
+        releaseFlowFiles(1);
         waitForNodeLocalQueueEmpty(1, connectorId);
         assertTrue(nodeLocalQueuedCount(2, connectorId) > 0);
         getClientUtil().stopConnector(connectorId);
@@ -107,7 +104,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
 
     @Test
     @Timeout(300)
-    public void testDisconnectedDrainingNodeBlocksPhaseTwoAndKeepsPendingFlowOnReconnect() throws Exception {
+    public void testDisconnectedDrainingNodeBlocksDrainBarrierAndKeepsPendingFlowOnReconnect() throws Exception {
         final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
         triggerUpgrade(connectorId);
         requestStart(connectorId);
@@ -115,7 +112,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         waitForNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
 
         disconnectNode(2);
-        createGates();
+        releaseFlowFiles();
         waitForNodeConnectorState(1, connectorId, ConnectorState.STOPPED);
         assertNodeStoppedPendingWithOldFlow(1, connectorId);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.FAILED);
@@ -146,13 +143,12 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         final String startReason = actionReason(connectorId, "START");
         assertNotNull(startReason);
         assertTrue(startReason.startsWith(LOADED_BUNDLE_MISMATCH_REASON), startReason);
-        createGates();
-        final NiFiClientException failure = assertThrows(NiFiClientException.class, () -> requestStart(connectorId));
-        assertTrue(failure.getMessage().contains(LOADED_BUNDLE_MISMATCH_REASON), failure.getMessage());
+        releaseFlowFiles();
+        assertThrows(NiFiClientException.class, () -> requestStart(connectorId));
         assertNodeStoppedPendingWithOldFlow(1, connectorId);
         assertNodeConnectorState(2, connectorId, ConnectorState.STOPPED);
         assertNodeConnectionPresent(2, connectorId);
-        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
 
         changeNodeVersion(2, connectorId, DRAIN_V2);
@@ -166,23 +162,59 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
 
     @Test
     @Timeout(240)
-    public void testApplyFailureRetriesApplyOnEveryNodeWithoutRerunningHook() throws Exception {
+    public void testApplyFailureRetriesApplyOnFailedNodeWithoutRerunningHook() throws Exception {
         final String connectorId = queueStoppedUpgrade("NO_OP", false, "original");
         changeVersion(connectorId, DRAIN_V2);
         getClientUtil().configureConnector(connectorId, "Upgrade", properties("NO_OP", false, "edited"));
-        writeNodeFile(1, APPLY_FAIL_FILE, "");
+        injectFault(1, UpgradeDrainFault.APPLY_FAILS);
 
         requestStart(connectorId);
-        getClientUtil().waitForConnectorState(connectorId, ConnectorState.STOPPED);
+        // The merged cluster state reports UPDATE_FAILED as soon as one node fails. A node that is still finishing its
+        // failed evolution treats a new start request as part of that evolution, so wait for every node to fail first.
+        waitForNodeConnectorState(1, connectorId, ConnectorState.UPDATE_FAILED);
+        waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATE_FAILED);
         assertManagedFlowBundle(FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId), outgoingBundle());
 
-        deleteNodeFiles(APPLY_FAIL_FILE);
+        clearFault(UpgradeDrainFault.APPLY_FAILS);
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
         assertEquals("edited", findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());
-        assertNotPending(connectorId);
+        stopAndAssertNotPending(connectorId);
+    }
+
+    /**
+     * A node that disconnects while applying the upgraded flow does not hold back the connected node. Once it finishes
+     * applying and reconnects, it starts on the upgraded flow as well.
+     */
+    @Test
+    @Timeout(300)
+    public void testNodeDisconnectDuringApplyDoesNotBlockConnectedNode() throws Exception {
+        final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
+        triggerUpgrade(connectorId);
+        injectFault(2, UpgradeDrainFault.APPLY_BLOCKS);
+        requestStart(connectorId);
+        releaseFlowFiles();
+        waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATING);
+        // Node 1 waits at UPDATED while node 2 is UPDATING. Reaching UPDATED shows it has passed the drain barrier,
+        // which requires every node to be connected.
+        waitForNodeConnectorState(1, connectorId, ConnectorState.UPDATED);
+
+        disconnectNode(2);
+        waitForNodeConnectorState(1, connectorId, ConnectorState.RUNNING);
+        assertNodeRunningWithoutRemovedConnection(1, connectorId);
+
+        clearFault(UpgradeDrainFault.APPLY_BLOCKS);
+        waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATED);
+        reconnectNode(2);
+        waitForAllNodesConnected();
+        waitForNodeConnectorState(2, connectorId, ConnectorState.RUNNING);
+        assertNodeRunningWithoutRemovedConnection(1, connectorId);
+        assertNodeRunningWithoutRemovedConnection(2, connectorId);
+        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
+        stopAndAssertNotPending(connectorId);
     }
 
     private void changeNodeVersion(final int nodeIndex, final String connectorId, final String version) throws NiFiClientException, IOException {
@@ -201,10 +233,6 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         } finally {
             setupClient();
         }
-    }
-
-    private void createGate(final int nodeIndex) throws IOException {
-        Files.writeString(new File(nodeDirectory(nodeIndex), GATE_FILE).toPath(), "");
     }
 
     private int nodeLocalQueuedCount(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
@@ -260,7 +288,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         }
     }
 
-    private void assertNodeRemainsBeforePhaseTwo(final int nodeIndex, final String connectorId)
+    private void assertNodeWaitsAtDrainBarrier(final int nodeIndex, final String connectorId)
             throws NiFiClientException, IOException, InterruptedException {
         switchClientToNode(nodeIndex);
         try {
@@ -269,7 +297,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
             while (System.nanoTime() < deadline) {
                 final ConnectorEntity connector = connectorClient.getConnector(connectorId);
                 assertEquals(ConnectorState.DRAINING.name(), connector.getComponent().getState());
-                assertEquals(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name(), connector.getComponent().getFlowEvolutionStatus());
+                assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name(), connector.getComponent().getFlowEvolutionStatus());
                 Thread.sleep(100L);
             }
 

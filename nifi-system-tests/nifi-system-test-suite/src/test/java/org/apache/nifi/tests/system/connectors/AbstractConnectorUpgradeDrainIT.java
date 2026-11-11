@@ -42,7 +42,6 @@ import org.junit.jupiter.api.BeforeEach;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,11 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMigrationIT {
 
-    static final String GATE_FILE = "upgrade-drain-gate.txt";
-    static final String APPLY_FAIL_FILE = "upgrade-drain-apply-fail.txt";
-    static final String HOOK_RESULT_FILE = "upgrade-drain-hook-result.txt";
-    static final String ACTIVE_FLOW_FILE = "upgrade-drain-active-flow.txt";
-    private static final List<String> SWITCH_FILES = List.of(APPLY_FAIL_FILE, HOOK_RESULT_FILE, ACTIVE_FLOW_FILE);
+    private static final String GATE_FILE = "upgrade-drain-gate.txt";
     static final String REMOVED_CONNECTION = "Removed Connection";
     static final String REMOVED_PROCESSOR_CHAIN = "Removed Processor Chain";
     static final String RELAY_PROCESSOR = "RelayFlowFile";
@@ -78,6 +73,27 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
     private static final Map<String, String> DRAIN_NAR_IDS = Map.of(
         DRAIN_V1, "nifi-connector-upgrade-drain-v1-nar",
         DRAIN_V2, "nifi-connector-upgrade-drain-v2-nar");
+
+    /**
+     * Makes the version 2 UpgradeDrainConnector misbehave. The Connector reads the named file from its node's working
+     * directory, and the file contents select the behavior. Faults that share a file replace each other.
+     */
+    protected enum UpgradeDrainFault {
+        HOOK_RETURNS_NULL_FUTURE("upgrade-drain-hook-result.txt", "NULL_FUTURE"),
+        HOOK_RETURNS_FAILED_FUTURE("upgrade-drain-hook-result.txt", "FAILED_FUTURE"),
+        ACTIVE_FLOW_RETURNS_NULL("upgrade-drain-active-flow.txt", "NULL"),
+        ACTIVE_FLOW_THROWS("upgrade-drain-active-flow.txt", "THROW"),
+        APPLY_FAILS("upgrade-drain-apply-fail.txt", ""),
+        APPLY_BLOCKS("upgrade-drain-apply-block.txt", "");
+
+        private final String fileName;
+        private final String contents;
+
+        UpgradeDrainFault(final String fileName, final String contents) {
+            this.fileName = fileName;
+            this.contents = contents;
+        }
+    }
 
     /**
      * Identifies a Connector bundle in assertions. A null version matches any version of the artifact.
@@ -112,10 +128,24 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
     protected abstract ExpectedBundle incomingBundle();
 
     @BeforeEach
-    public void clearUpgradeDrainSwitches() {
-        for (final String switchFile : SWITCH_FILES) {
-            deleteNodeFiles(switchFile);
+    public void clearFaults() {
+        for (final UpgradeDrainFault fault : UpgradeDrainFault.values()) {
+            clearFault(fault);
         }
+    }
+
+    protected void injectFault(final UpgradeDrainFault fault) throws IOException {
+        for (int nodeIndex = 1; nodeIndex <= nodeCount(); nodeIndex++) {
+            injectFault(nodeIndex, fault);
+        }
+    }
+
+    protected void injectFault(final int nodeIndex, final UpgradeDrainFault fault) throws IOException {
+        writeToNodeDirectory(nodeIndex, fault.fileName, fault.contents);
+    }
+
+    protected void clearFault(final UpgradeDrainFault fault) {
+        deleteFromNodeDirectories(fault.fileName);
     }
 
     protected String createOutgoingConnector(final String mode, final boolean removeConnection, final String comment) throws Exception {
@@ -123,11 +153,11 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
     }
 
     protected String queueStoppedUpgrade(final String mode, final boolean removeConnection, final String comment) throws Exception {
-        return queueStopped(createOutgoingConnector(mode, removeConnection, comment));
+        return queueAtLeastOneFlowFileAndStop(createOutgoingConnector(mode, removeConnection, comment));
     }
 
-    protected String queueStopped(final String connectorId) throws Exception {
-        deleteGates();
+    protected String queueAtLeastOneFlowFileAndStop(final String connectorId) throws Exception {
+        holdFlowFiles();
         getClientUtil().startConnector(connectorId);
         waitForConnectorMinQueueCount(connectorId, 1);
         getClientUtil().stopConnector(connectorId);
@@ -183,26 +213,35 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
         return connectorClient.updateConnector(update);
     }
 
-    protected void createGates() throws IOException {
-        writeNodeFile(GATE_FILE);
-    }
-
-    private void writeNodeFile(final String fileName) throws IOException {
-        writeNodeFiles(fileName, "");
-    }
-
-    protected void writeNodeFiles(final String fileName, final String contents) throws IOException {
+    /**
+     * Stops the generator and lets the terminator drop queued FlowFiles on every node.
+     */
+    protected void releaseFlowFiles() throws IOException {
         for (int nodeIndex = 1; nodeIndex <= nodeCount(); nodeIndex++) {
-            writeNodeFile(nodeIndex, fileName, contents);
+            releaseFlowFiles(nodeIndex);
         }
     }
 
-    protected void writeNodeFile(final int nodeIndex, final String fileName, final String contents) throws IOException {
+    /**
+     * Stops the generator and lets the terminator drop queued FlowFiles on one node.
+     */
+    protected void releaseFlowFiles(final int nodeIndex) throws IOException {
+        writeToNodeDirectory(nodeIndex, GATE_FILE, "");
+    }
+
+    /**
+     * Lets the generator run and makes the terminator hold every FlowFile on every node.
+     */
+    protected void holdFlowFiles() {
+        deleteFromNodeDirectories(GATE_FILE);
+    }
+
+    private void writeToNodeDirectory(final int nodeIndex, final String fileName, final String contents) throws IOException {
         Files.writeString(new File(nodeDirectory(nodeIndex), fileName).toPath(), contents);
     }
 
-    protected void deleteNodeFiles(final String fileName) {
-        for (final File directory : nodeDirectories()) {
+    private void deleteFromNodeDirectories(final String fileName) {
+        for (final File directory : instanceDirectories()) {
             final File file = new File(directory, fileName);
             if (file.exists()) {
                 assertTrue(file.delete(), file.getAbsolutePath());
@@ -210,7 +249,8 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
         }
     }
 
-    protected void assertNotPending(final String connectorId) throws IOException {
+    protected void stopAndAssertNotPending(final String connectorId) throws IOException {
+        getNiFiInstance().stop();
         for (int nodeIndex = 1; nodeIndex <= nodeCount(); nodeIndex++) {
             final VersionedConnector connector = FlowDefinitionFiles.readConnector(nodeInstance(nodeIndex), connectorId);
             assertManagedFlowBundle(connector, incomingBundle());
@@ -234,21 +274,6 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
 
     protected File nodeDirectory(final int nodeIndex) {
         return nodeInstance(nodeIndex).getInstanceDirectory();
-    }
-
-    protected NiFiInstance firstNode() {
-        return getNumberOfNodes() <= 1 ? getNiFiInstance() : getNiFiInstance().getNodeInstance(1);
-    }
-
-    protected List<File> nodeDirectories() {
-        if (getNumberOfNodes() <= 1) {
-            return List.of(getNiFiInstance().getInstanceDirectory());
-        }
-        final List<File> directories = new ArrayList<>();
-        for (int nodeIndex = 1; nodeIndex <= getNumberOfNodes(); nodeIndex++) {
-            directories.add(getNiFiInstance().getNodeInstance(nodeIndex).getInstanceDirectory());
-        }
-        return directories;
     }
 
     protected void requestStart(final String connectorId) throws NiFiClientException, IOException {
@@ -304,15 +329,6 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
             properties.put("Comment", comment);
         }
         return properties;
-    }
-
-    protected void deleteGates() {
-        for (final File directory : nodeDirectories()) {
-            final File gate = new File(directory, GATE_FILE);
-            if (gate.exists()) {
-                assertTrue(gate.delete());
-            }
-        }
     }
 
     protected void assertConnectorState(final String connectorId, final ConnectorState state) throws NiFiClientException, IOException {

@@ -20,36 +20,52 @@ package org.apache.nifi.components.connector;
 import java.util.Collection;
 
 /**
- * Reports local progress through a pending Connector flow evolution.
+ * Reports local progress through the evolve-drain phase of a pending Connector flow evolution. Applying the upgraded flow
+ * after the evolve-drain phase is tracked through {@link ConnectorState}, as for a configuration update.
  */
 public enum FlowEvolutionStatus {
+    /**
+     * No evolution is pending, so the node no longer needs the outgoing flow.
+     */
     INACTIVE,
-    PHASE_ONE_PENDING,
-    PHASE_ONE_COMPLETE,
-    PHASE_TWO_COMPLETE,
+
+    /**
+     * The node still has the outgoing flow and has not finished draining it.
+     */
+    EVOLVE_DRAIN_PENDING,
+
+    /**
+     * The node has drained the outgoing flow and has not yet applied the upgraded flow.
+     */
+    EVOLVE_DRAIN_COMPLETE,
+
     FAILED;
 
     /**
-     * Merges statuses from every cluster participant. The lowest ordinal wins so the cluster advances only when
-     * every node has reached a phase. {@link #FAILED} wins over every other status.
+     * Merges statuses from every cluster participant. {@link #INACTIVE} nodes have nothing to drain and are ignored.
+     * Of the rest, the lowest ordinal wins so the cluster passes the drain barrier only when every node that still has
+     * the outgoing flow has drained it. {@link #FAILED} wins over every other status.
      *
      * @param statuses the statuses to merge; a null or empty collection merges to {@link #INACTIVE}
-     * @return the merged status
+     * @return the merged status, or {@link #INACTIVE} when every participant is inactive
      */
     public static FlowEvolutionStatus merge(final Collection<FlowEvolutionStatus> statuses) {
         if (statuses == null || statuses.isEmpty()) {
             return INACTIVE;
         }
 
-        FlowEvolutionStatus mergedStatus = PHASE_TWO_COMPLETE;
+        FlowEvolutionStatus mergedStatus = INACTIVE;
         for (final FlowEvolutionStatus status : statuses) {
-            final FlowEvolutionStatus effective = status == null ? INACTIVE : status;
-            if (effective == FAILED) {
+            if (status == FAILED) {
                 return FAILED;
             }
 
-            if (effective.ordinal() < mergedStatus.ordinal()) {
-                mergedStatus = effective;
+            if (status == null || status == INACTIVE) {
+                continue;
+            }
+
+            if (mergedStatus == INACTIVE || status.ordinal() < mergedStatus.ordinal()) {
+                mergedStatus = status;
             }
         }
 

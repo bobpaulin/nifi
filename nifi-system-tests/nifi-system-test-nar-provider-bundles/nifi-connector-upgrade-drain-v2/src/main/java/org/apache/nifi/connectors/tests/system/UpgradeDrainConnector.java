@@ -31,7 +31,9 @@ import org.apache.nifi.components.connector.components.ProcessorFacade;
 import org.apache.nifi.components.connector.util.VersionedFlowUtils;
 import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.Position;
+import org.apache.nifi.flow.ScheduledState;
 import org.apache.nifi.flow.VersionedConnection;
+import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedExternalFlow;
 import org.apache.nifi.flow.VersionedParameter;
 import org.apache.nifi.flow.VersionedParameterContext;
@@ -116,6 +118,16 @@ public class UpgradeDrainConnector extends AbstractConnector {
         .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
         .build();
 
+    static final ConnectorPropertyDescriptor MARKER_SERVICE = new ConnectorPropertyDescriptor.Builder()
+        .name("Marker Service")
+        .description("When true, the flow includes an enabled Controller Service that stores a marker in its local state.")
+        .required(false)
+        .defaultValue("false")
+        .allowableValues("true", "false")
+        .type(PropertyType.STRING)
+        .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+        .build();
+
     private static final ConnectorPropertyGroup PROPERTY_GROUP = new ConnectorPropertyGroup.Builder()
         .name("Upgrade")
         .addProperty(GATE_FILE_PATH)
@@ -125,6 +137,7 @@ public class UpgradeDrainConnector extends AbstractConnector {
         .addProperty(UPGRADE_SECRET)
         .addProperty(DRAIN_LABEL)
         .addProperty(REMOVED_PROCESSOR_CHAIN)
+        .addProperty(MARKER_SERVICE)
         .build();
 
     private static final ConfigurationStep CONFIG_STEP = new ConfigurationStep.Builder()
@@ -138,6 +151,7 @@ public class UpgradeDrainConnector extends AbstractConnector {
     private static final String RELAY_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainRelay";
     private static final String TERMINATE_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainTerminate";
     private static final String SWAPPED_PROCESSOR_ID = "upgrade-drain-swapped-processor";
+    private static final String MARKER_SERVICE_TYPE = "org.apache.nifi.cs.tests.system.UpgradeDrainMarkerService";
 
     @Override
     protected void onStepConfigured(final String stepName, final FlowContext workingContext) {
@@ -174,6 +188,16 @@ public class UpgradeDrainConnector extends AbstractConnector {
     public void applyUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
         if (Files.exists(Path.of("upgrade-drain-apply-fail.txt"))) {
             throw new FlowUpdateException("apply failed");
+        }
+
+        final Path applyBlock = Path.of("upgrade-drain-apply-block.txt");
+        while (Files.exists(applyBlock)) {
+            try {
+                Thread.sleep(200L);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new FlowUpdateException("Interrupted while apply was blocked", e);
+            }
         }
 
         getInitializationContext().updateFlow(activeContext, buildFlow(workingContext), BundleCompatibility.RESOLVE_BUNDLE);
@@ -265,6 +289,12 @@ public class UpgradeDrainConnector extends AbstractConnector {
                     VersionedFlowUtils.createConnectableComponent(terminate), Set.of("success"));
                 connection.setName("Removed Connection");
             }
+        }
+
+        if (Boolean.parseBoolean(property(flowContext, MARKER_SERVICE))) {
+            final VersionedControllerService markerService = VersionedFlowUtils.addControllerService(rootGroup, MARKER_SERVICE_TYPE, GATE_BUNDLE, MARKER_SERVICE.getName());
+            markerService.setScheduledState(ScheduledState.ENABLED);
+            generate.getProperties().put(MARKER_SERVICE.getName(), markerService.getIdentifier());
         }
 
         final VersionedExternalFlow flow = new VersionedExternalFlow();

@@ -2561,7 +2561,7 @@ public class StandardNiFiServiceFacadeTest {
         final BundleCoordinate existingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
         final BundleCoordinate incomingCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "2.0.0");
         final ConnectorNode connectorNode = configureConnectorForBundleUpdate(connectorId, "org.apache.nifi.connectors.TestConnector", existingCoordinate, incomingCoordinate);
-        final NodeIdentifier unconnectedNode = configureClusterWithUnconnectedNode(NodeConnectionState.DISCONNECTED, true);
+        final NodeIdentifier unconnectedNode = configureClusterWithUnconnectedNode();
 
         final ConnectorDTO connectorDTO = new ConnectorDTO();
         connectorDTO.setId(connectorId);
@@ -2591,14 +2591,62 @@ public class StandardNiFiServiceFacadeTest {
         assertThrows(IllegalStateException.class, () -> serviceFacade.verifyUpdateConnector(connectorDTO));
     }
 
-    private NodeIdentifier configureClusterWithUnconnectedNode(final NodeConnectionState unconnectedState, final boolean localNodeConnected) {
+    @Test
+    public void testVerifyUpdateConnectorRejectsMismatchedExpectedBundle() {
+        final BundleCoordinate loadedCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        final BundleCoordinate expectedCoordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "2.0.0");
+        final StartRequest startRequest = configureStartRequest(loadedCoordinate, expectedCoordinate);
+        startRequest.connectorDTO().setExpectedBundle(new BundleDTO(expectedCoordinate.getGroup(), expectedCoordinate.getId(), expectedCoordinate.getVersion()));
+
+        final IllegalStateException exception = assertThrows(IllegalStateException.class, () -> serviceFacade.verifyUpdateConnector(startRequest.connectorDTO()));
+
+        assertTrue(exception.getMessage().contains(loadedCoordinate.toString()));
+        assertTrue(exception.getMessage().contains(expectedCoordinate.toString()));
+        verify(startRequest.connectorNode(), never()).verifyCanStart();
+    }
+
+    @Test
+    public void testVerifyUpdateConnectorAcceptsMatchingExpectedBundle() {
+        final BundleCoordinate coordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        final StartRequest startRequest = configureStartRequest(coordinate, coordinate);
+        startRequest.connectorDTO().setExpectedBundle(new BundleDTO(coordinate.getGroup(), coordinate.getId(), coordinate.getVersion()));
+
+        serviceFacade.verifyUpdateConnector(startRequest.connectorDTO());
+
+        verify(startRequest.connectorNode()).verifyCanStart();
+    }
+
+    @Test
+    public void testVerifyUpdateConnectorAllowsMissingExpectedBundle() {
+        final BundleCoordinate coordinate = new BundleCoordinate("org.apache.nifi", "nifi-test-nar", "1.0.0");
+        final StartRequest startRequest = configureStartRequest(coordinate, coordinate);
+
+        serviceFacade.verifyUpdateConnector(startRequest.connectorDTO());
+
+        verify(startRequest.connectorNode()).verifyCanStart();
+    }
+
+    private record StartRequest(ConnectorNode connectorNode, ConnectorDTO connectorDTO) {
+    }
+
+    private StartRequest configureStartRequest(final BundleCoordinate loadedCoordinate, final BundleCoordinate availableCoordinate) {
+        final String connectorId = "connector-id";
+        final ConnectorNode connectorNode = configureConnectorForBundleUpdate(connectorId, "org.apache.nifi.connectors.TestConnector", loadedCoordinate, availableCoordinate);
+
+        final ConnectorDTO connectorDTO = new ConnectorDTO();
+        connectorDTO.setId(connectorId);
+        connectorDTO.setState(ScheduledState.RUNNING.name());
+        return new StartRequest(connectorNode, connectorDTO);
+    }
+
+    private NodeIdentifier configureClusterWithUnconnectedNode() {
         final NodeIdentifier connectedNode = new NodeIdentifier("node-1", "node-1.example.com", 8443, "node-1.example.com", 9999, null, null, null, false);
         final NodeIdentifier unconnectedNode = new NodeIdentifier("node-2", "node-2.example.com", 8443, "node-2.example.com", 9999, null, null, null, false);
         final ClusterCoordinator clusterCoordinator = mock(ClusterCoordinator.class);
-        when(clusterCoordinator.isConnected()).thenReturn(localNodeConnected);
+        when(clusterCoordinator.isConnected()).thenReturn(true);
         when(clusterCoordinator.getConnectionStates()).thenReturn(Map.of(
             NodeConnectionState.CONNECTED, List.of(connectedNode),
-            unconnectedState, List.of(unconnectedNode)));
+            NodeConnectionState.DISCONNECTED, List.of(unconnectedNode)));
         serviceFacade.setClusterCoordinator(clusterCoordinator);
         return unconnectedNode;
     }
@@ -2617,7 +2665,6 @@ public class StandardNiFiServiceFacadeTest {
         serviceFacade.setRevisionManager(revisionManager);
         serviceFacade.setEntityFactory(new EntityFactory());
         serviceFacade.setControllerFacade(controllerFacade);
-        serviceFacade.setBulletinRepository(new MockTestBulletinRepository());
 
         final ConnectorNode connectorNode = mock(ConnectorNode.class);
         final FrameworkFlowContext flowContext = mock(FrameworkFlowContext.class);
@@ -2636,7 +2683,6 @@ public class StandardNiFiServiceFacadeTest {
         connectorDTO.setState("RUNNING");
         when(dtoFactory.createConnectorDto(connectorNode)).thenReturn(connectorDTO);
         when(dtoFactory.createConnectorStatusDto(connectorNode, managedGroupStatus)).thenReturn(null);
-        when(dtoFactory.createBulletinDtos(any())).thenReturn(List.of());
 
         final RevisionDTO revisionDTO = new RevisionDTO();
         when(dtoFactory.createRevisionDTO(any(Revision.class))).thenReturn(revisionDTO);

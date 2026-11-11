@@ -79,7 +79,7 @@ public class ConnectorUpgradeDrainProviderIT extends AbstractNarSwapUpgradeDrain
         assertEquals("upgraded", configurationValue(pending.getComponent().getActiveConfiguration(), DRAIN_LABEL));
         assertEquals("upgraded", configurationValue(pending.getComponent().getWorkingConfiguration(), DRAIN_LABEL));
 
-        createGates();
+        releaseFlowFiles();
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertEquals(SUPPLIED_COMMENT, findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());

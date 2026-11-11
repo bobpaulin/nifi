@@ -202,7 +202,8 @@ public interface ConnectorNode extends ComponentAuthorizable, VersionedComponent
     boolean isPendingFlowEvolution();
 
     /**
-     * @return local progress through the pending flow evolution
+     * @return local progress through the pending flow evolution; {@link FlowEvolutionStatus#EVOLVE_DRAIN_PENDING} while this
+     *         node still has an outgoing flow to drain, even before an evolution attempt begins
      */
     default FlowEvolutionStatus getFlowEvolutionStatus() {
         return FlowEvolutionStatus.INACTIVE;
@@ -346,22 +347,32 @@ public interface ConnectorNode extends ComponentAuthorizable, VersionedComponent
     void prepareForUpdate() throws FlowUpdateException;
 
     /**
-     * Moves a pending upgrade from STOPPED to DRAINING and creates the evolution context.
+     * Moves a pending upgrade from STOPPED or UPDATE_FAILED to DRAINING and creates the evolution context. When an earlier
+     * attempt failed after every node had drained, this attempt resumes after the hook without running it again.
      *
-     * @throws IllegalStateException if no evolution is pending or the Connector is not STOPPED
+     * @throws IllegalStateException if no evolution is pending or the Connector is not STOPPED or UPDATE_FAILED
      */
     void prepareFlowEvolution();
 
     /**
-     * Runs preflight, the Connector evolution hook, and local phase one on the provided executor. The executor must
-     * tolerate a task blocked for the duration of the hook. A resumed evolution runs preflight without invoking the
+     * Runs preflight, the Connector evolution hook, and the local evolve-drain phase on the provided executor. The executor
+     * must tolerate a task blocked for the duration of the hook. A resumed evolution runs preflight without invoking the
      * hook. abortUpdate cancels the returned Future and the hook.
      *
-     * @param executor executor used to run local phase one
-     * @return the future for local phase one of the prepared evolution
+     * @param executor executor used to run the local evolve-drain phase
+     * @return the future for the local evolve-drain phase of the prepared evolution
      * @throws FlowUpdateException if the prepared evolution is no longer active
      */
     Future<Void> evolveFlow(ExecutorService executor) throws FlowUpdateException;
+
+    /**
+     * Moves an evolution whose evolve-drain phase is complete from DRAINING to PREPARING_FOR_UPDATE so the upgraded flow
+     * can be applied like a configuration update. The caller then calls {@link #prepareForUpdate()} and {@link #applyUpdate()}.
+     *
+     * @throws FlowUpdateException if the evolution is no longer active, the evolve-drain phase is not complete, or the upgraded flow
+     *         removes a connection that still holds FlowFiles
+     */
+    void beginEvolvedFlowUpdate() throws FlowUpdateException;
 
     /**
      * @return true when the persisted flow belongs to a different bundle and configuration must not be inherited

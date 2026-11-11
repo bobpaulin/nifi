@@ -45,7 +45,7 @@ public class ClusteredConnectorUpgradeDrainIT extends AbstractNarSwapUpgradeDrai
         final Map<String, String> properties = properties("DRAIN", true, null);
         properties.put(REMOVED_PROCESSOR_CHAIN, "true");
         final String connectorId = createOutgoingConnector(properties);
-        deleteGates();
+        holdFlowFiles();
         getClientUtil().startConnector(connectorId);
         waitForConnectionMinQueueCount(connectorId, REMOVED_CONNECTION, 1);
         getNiFiInstance().stop();
@@ -59,15 +59,13 @@ public class ClusteredConnectorUpgradeDrainIT extends AbstractNarSwapUpgradeDrai
         assertNotNull(findProcessor(connectorId, "TerminateFlowFile"));
         assertTrue(getConnectionQueuedCount(connectorId, REMOVED_CONNECTION) > 0);
 
-        createGates();
+        releaseFlowFiles();
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNull(findProcessor(connectorId, RELAY_PROCESSOR));
         assertNull(findProcessor(connectorId, REMOVED_PROCESSOR));
         assertNotNull(findProcessor(connectorId, SWAPPED_PROCESSOR));
         assertNotNull(findProcessor(connectorId, "TerminateFlowFile"));
         assertNull(findConnection(connectorId, REMOVED_CONNECTION));
-
-        getNiFiInstance().stop();
-        assertNotPending(connectorId);
+        stopAndAssertNotPending(connectorId);
     }
 }

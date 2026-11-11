@@ -182,59 +182,24 @@ class ConnectorEntityMergerTest {
     }
 
     @Test
-    void testMergeFlowEvolutionStatusRequiresEveryNodeComplete() {
-        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "DRAINING");
-        final ConnectorEntity node1Entity = createConnectorEntity("connector1", "DRAINING");
-        final ConnectorEntity node2Entity = createConnectorEntity("connector1", "DRAINING");
+    void testMergeFlowEvolutionStatusCombinesNodeStatuses() {
+        final ConnectorEntity clientEntity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity node1Entity = createConnectorEntity("connector1", "STOPPED");
+        final ConnectorEntity node2Entity = createConnectorEntity("connector1", "STOPPED");
         final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
         entityMap.put(getNodeIdentifier("client", 8000), clientEntity);
         entityMap.put(getNodeIdentifier("node1", 8001), node1Entity);
         entityMap.put(getNodeIdentifier("node2", 8002), node2Entity);
 
-        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
-        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
-        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_PENDING.name());
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.EVOLVE_DRAIN_PENDING.name());
         ConnectorEntityMerger.merge(clientEntity, entityMap);
-        assertEquals(FlowEvolutionStatus.PHASE_ONE_PENDING.name(), clientEntity.getComponent().getFlowEvolutionStatus());
+        assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_PENDING.name(), clientEntity.getComponent().getFlowEvolutionStatus());
 
-        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
-        node2Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name());
+        clientEntity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name());
+        node1Entity.getComponent().setFlowEvolutionStatus(null);
         ConnectorEntityMerger.merge(clientEntity, entityMap);
-        assertEquals(FlowEvolutionStatus.PHASE_ONE_COMPLETE.name(), clientEntity.getComponent().getFlowEvolutionStatus());
-
-        node1Entity.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.FAILED.name());
-        ConnectorEntityMerger.merge(clientEntity, entityMap);
-        assertEquals(FlowEvolutionStatus.FAILED.name(), clientEntity.getComponent().getFlowEvolutionStatus());
-    }
-
-    @Test
-    void testMergeCountsFinishedRunningNodeAsPhaseTwoWhileAPeerIsStillAtPhaseTwo() {
-        final ConnectorEntity finished = createConnectorEntity("connector1", "RUNNING");
-        final ConnectorEntity waiting = createConnectorEntity("connector1", "DRAINING");
-        finished.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.INACTIVE.name());
-        waiting.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_TWO_COMPLETE.name());
-        final Map<NodeIdentifier, ConnectorEntity> entityMap = new HashMap<>();
-        entityMap.put(getNodeIdentifier("finished", 8000), finished);
-        entityMap.put(getNodeIdentifier("waiting", 8001), waiting);
-
-        ConnectorEntityMerger.merge(waiting, entityMap);
-        assertEquals(FlowEvolutionStatus.PHASE_TWO_COMPLETE.name(), waiting.getComponent().getFlowEvolutionStatus());
-
-        final ConnectorEntity restarted = createConnectorEntity("connector1", "STOPPED");
-        restarted.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.INACTIVE.name());
-        entityMap.put(getNodeIdentifier("restarted", 8002), restarted);
-        waiting.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.PHASE_TWO_COMPLETE.name());
-        ConnectorEntityMerger.merge(waiting, entityMap);
-        assertEquals(FlowEvolutionStatus.INACTIVE.name(), waiting.getComponent().getFlowEvolutionStatus());
-
-        entityMap.remove(getNodeIdentifier("restarted", 8002));
-        entityMap.remove(getNodeIdentifier("waiting", 8001));
-        final ConnectorEntity otherFinished = createConnectorEntity("connector1", "RUNNING");
-        otherFinished.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.INACTIVE.name());
-        entityMap.put(getNodeIdentifier("other", 8001), otherFinished);
-        finished.getComponent().setFlowEvolutionStatus(FlowEvolutionStatus.INACTIVE.name());
-        ConnectorEntityMerger.merge(finished, entityMap);
-        assertEquals(FlowEvolutionStatus.INACTIVE.name(), finished.getComponent().getFlowEvolutionStatus());
+        assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name(), clientEntity.getComponent().getFlowEvolutionStatus());
     }
 
     @Test

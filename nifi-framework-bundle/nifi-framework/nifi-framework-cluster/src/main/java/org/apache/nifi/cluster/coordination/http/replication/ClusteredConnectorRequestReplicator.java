@@ -28,6 +28,7 @@ import org.apache.nifi.cluster.coordination.node.NodeConnectionStatus;
 import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.cluster.manager.exception.NoConnectedNodesException;
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
+import org.apache.nifi.components.connector.ConnectorClusterUnavailableException;
 import org.apache.nifi.components.connector.ConnectorRequestReplicator;
 import org.apache.nifi.components.connector.ConnectorState;
 import org.apache.nifi.components.connector.FlowEvolutionStatus;
@@ -94,7 +95,12 @@ public class ClusteredConnectorRequestReplicator implements ConnectorRequestRepl
         logger.debug("Connector [{}] — replicating GET to URI [{}]", connectorId, uri);
 
         // User is null. GET /connectors/{id} API endpoint has special logic for authorizing requests made by nifi cluster nodes based on mTLS cert SANs
-        final AsyncClusterResponse asyncResponse = requestReplicator.replicate(null, GET, uri, Map.of(), Map.of());
+        final AsyncClusterResponse asyncResponse;
+        try {
+            asyncResponse = requestReplicator.replicate(null, GET, uri, Map.of(), Map.of());
+        } catch (final NoConnectedNodesException e) {
+            throw new ConnectorClusterUnavailableException("No connected nodes while retrieving Connector %s".formatted(connectorId), e);
+        }
 
         try {
             final NodeResponse mergedNodeResponse = asyncResponse.awaitMergedResponse();
@@ -152,18 +158,19 @@ public class ClusteredConnectorRequestReplicator implements ConnectorRequestRepl
     private void verifyClusterMembership(final String connectorId, final boolean requireAllConnected) throws IOException {
         final ClusterCoordinator clusterCoordinator = clusterCoordinatorSupplier.get();
         if (clusterCoordinator == null || !clusterCoordinator.isConnected()) {
-            throw new NoConnectedNodesException();
+            throw new ConnectorClusterUnavailableException("No connected nodes while retrieving Connector %s".formatted(connectorId));
         }
 
         for (final NodeConnectionStatus connectionStatus : clusterCoordinator.getConnectionStatuses()) {
             final NodeConnectionState state = connectionStatus.getState();
             if (state == NodeConnectionState.CONNECTING
                     || (state == NodeConnectionState.DISCONNECTED && connectionStatus.getDisconnectCode() == DisconnectionCode.NOT_YET_CONNECTED)) {
-                throw new NoConnectedNodesException();
+                throw new ConnectorClusterUnavailableException("Cannot retrieve Connector %s because node %s is still joining the cluster"
+                        .formatted(connectorId, connectionStatus.getNodeIdentifier()));
             }
             if (requireAllConnected && state != NodeConnectionState.CONNECTED && state != NodeConnectionState.REMOVED) {
-                throw new IOException("Cannot retrieve flow evolution status for Connector " + connectorId
-                        + " because node " + connectionStatus.getNodeIdentifier() + " is " + state);
+                throw new IOException("Cannot retrieve flow evolution status for Connector %s because node %s is %s"
+                        .formatted(connectorId, connectionStatus.getNodeIdentifier(), state));
             }
         }
     }

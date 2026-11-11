@@ -36,11 +36,10 @@ import java.util.Map;
 import java.util.TreeMap;
 
 public class ConnectorEntityMerger {
-    public static final String LOADED_BUNDLE_MISMATCH_REASON = "Cluster nodes load different Connector versions: ";
+    static final String LOADED_BUNDLE_MISMATCH_REASON = "Cluster nodes load different Connector versions: ";
 
     private static final String CHANGE_VERSION_ACTION = "CHANGE_VERSION";
     private static final String START_ACTION = "START";
-
     /**
      * Merges the ConnectorEntity responses.
      *
@@ -51,10 +50,13 @@ public class ConnectorEntityMerger {
         final ConnectorDTO clientDto = clientEntity.getComponent();
         final Map<NodeIdentifier, ConnectorDTO> dtoMap = new HashMap<>();
         for (final Map.Entry<NodeIdentifier, ConnectorEntity> entry : entityMap.entrySet()) {
-            dtoMap.put(entry.getKey(), entry.getValue().getComponent());
+            final ConnectorEntity nodeConnectorEntity = entry.getValue();
+            final ConnectorDTO nodeConnectorDto = nodeConnectorEntity.getComponent();
+            dtoMap.put(entry.getKey(), nodeConnectorDto);
         }
 
         mergeDtos(clientDto, dtoMap);
+
         mergeStatus(clientEntity, entityMap);
     }
 
@@ -119,7 +121,6 @@ public class ConnectorEntityMerger {
 
         mergeChangeVersion(clientDto, dtoMap);
         mergeLoadedBundles(clientDto, dtoMap);
-        // Status is merged before state. State merge rewrites the client DTO, and the barrier has to see each node's own state.
         mergeFlowEvolutionStatus(clientDto, dtoMap);
         mergeState(clientDto, dtoMap);
 
@@ -239,42 +240,14 @@ public class ConnectorEntityMerger {
     }
 
     private static void mergeFlowEvolutionStatus(final ConnectorDTO clientDto, final Map<NodeIdentifier, ConnectorDTO> dtoMap) {
-        boolean anyPhaseTwo = false;
-        boolean anyEarlierPhase = false;
-        for (final ConnectorDTO nodeConnector : dtoMap.values()) {
-            final FlowEvolutionStatus status = reportedFlowEvolutionStatus(nodeConnector);
-            if (status == FlowEvolutionStatus.PHASE_TWO_COMPLETE) {
-                anyPhaseTwo = true;
-            } else if (status == FlowEvolutionStatus.PHASE_ONE_PENDING || status == FlowEvolutionStatus.PHASE_ONE_COMPLETE) {
-                anyEarlierPhase = true;
-            }
-        }
-        // A node that has finished reports INACTIVE once it is RUNNING. While a peer is still at phase two, count the
-        // finished node as phase two. Doing that for an earlier phase would hide a node that has not started.
-        final boolean countRunningInactiveAsPhaseTwo = anyPhaseTwo && !anyEarlierPhase;
-
         final List<FlowEvolutionStatus> statuses = new ArrayList<>(dtoMap.size());
         for (final ConnectorDTO nodeConnector : dtoMap.values()) {
-            statuses.add(barrierFlowEvolutionStatus(nodeConnector, countRunningInactiveAsPhaseTwo));
+            if (nodeConnector != null && nodeConnector.getFlowEvolutionStatus() != null) {
+                statuses.add(FlowEvolutionStatus.valueOf(nodeConnector.getFlowEvolutionStatus()));
+            }
         }
 
         clientDto.setFlowEvolutionStatus(FlowEvolutionStatus.merge(statuses).name());
-    }
-
-    private static FlowEvolutionStatus reportedFlowEvolutionStatus(final ConnectorDTO nodeConnector) {
-        if (nodeConnector == null || nodeConnector.getFlowEvolutionStatus() == null) {
-            return FlowEvolutionStatus.INACTIVE;
-        }
-        return FlowEvolutionStatus.valueOf(nodeConnector.getFlowEvolutionStatus());
-    }
-
-    private static FlowEvolutionStatus barrierFlowEvolutionStatus(final ConnectorDTO nodeConnector, final boolean countRunningInactiveAsPhaseTwo) {
-        final FlowEvolutionStatus status = reportedFlowEvolutionStatus(nodeConnector);
-        if (countRunningInactiveAsPhaseTwo && status == FlowEvolutionStatus.INACTIVE && nodeConnector != null
-                && ConnectorState.RUNNING.name().equals(nodeConnector.getState())) {
-            return FlowEvolutionStatus.PHASE_TWO_COMPLETE;
-        }
-        return status;
     }
 
     private static int getStatePriority(final String state) {

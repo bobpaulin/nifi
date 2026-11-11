@@ -17,6 +17,7 @@
 
 package org.apache.nifi.flow.synchronization;
 
+import org.apache.nifi.asset.AssetManager;
 import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
@@ -74,6 +75,7 @@ import org.apache.nifi.parameter.ParameterContextManager;
 import org.apache.nifi.parameter.ParameterDescriptor;
 import org.apache.nifi.parameter.ParameterProviderConfiguration;
 import org.apache.nifi.parameter.ParameterReferenceManager;
+import org.apache.nifi.parameter.ParameterReferencedControllerServiceData;
 import org.apache.nifi.parameter.StandardParameterContext;
 import org.apache.nifi.parameter.StandardParameterContextManager;
 import org.apache.nifi.processor.ProcessContext;
@@ -85,6 +87,7 @@ import org.apache.nifi.registry.flow.diff.StandardFlowComparator;
 import org.apache.nifi.registry.flow.diff.StaticDifferenceDescriptor;
 import org.apache.nifi.registry.flow.mapping.FlowMappingOptions;
 import org.apache.nifi.registry.flow.mapping.VersionedComponentFlowMapper;
+import org.apache.nifi.registry.flow.mapping.VersionedComponentStateLookup;
 import org.apache.nifi.remote.PublicPort;
 import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.scheduling.SchedulingStrategy;
@@ -134,6 +137,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
@@ -195,6 +199,15 @@ public class StandardVersionedComponentSynchronizerTest {
 
     private static final String UPDATED_CONTEXT_DESCRIPTION = "Updated context description";
 
+    private static final String SERVICE_VERSIONED_ID = "service-versioned-id";
+
+    private static final String SERVICE_PARAMETER_NAME = "service_param";
+
+    private static final PropertyDescriptor SERVICE_PROPERTY = new PropertyDescriptor.Builder()
+        .name("Service")
+        .identifiesControllerService(ControllerService.class)
+        .build();
+
     private ProcessorNode processorA;
     private ProcessorNode processorB;
     private Connection connectionAB;
@@ -212,6 +225,7 @@ public class StandardVersionedComponentSynchronizerTest {
     private ControllerServiceNode controllerServiceNode;
     private BundleCoordinate bundleCoordinate;
     private FlowManager flowManager;
+    private ReloadComponent reloadComponent;
 
     private final ArgumentCaptor<Map<String, String>> propertiesCaptor = ArgumentCaptor.captor();
 
@@ -224,7 +238,7 @@ public class StandardVersionedComponentSynchronizerTest {
         flowManager = mock(FlowManager.class);
         controllerServiceProvider = mock(ControllerServiceProvider.class);
         final Function<ProcessorNode, ProcessContext> processContextFactory = proc -> mock(ProcessContext.class);
-        final ReloadComponent reloadComponent = mock(ReloadComponent.class);
+        reloadComponent = mock(ReloadComponent.class);
         componentIdGenerator = (proposed, instance, group) -> proposed == null ? instance : proposed;
         componentScheduler = mock(ComponentScheduler.class);
         parameterContextManager = new StandardParameterContextManager();
@@ -776,29 +790,14 @@ public class StandardVersionedComponentSynchronizerTest {
         }).when(sourceProcessor).setAutoTerminatedRelationships(anySet());
         when(destinationProcessor.getAutoTerminatedRelationships()).thenReturn(Collections.emptySet());
 
-        final Connection connection = createMockConnection(sourceProcessor, destinationProcessor, processGroup);
-        when(connection.getVersionedComponentId()).thenReturn(Optional.of("connection-ab"));
-        when(connection.getName()).thenReturn("connection-ab");
-        when(connection.getLabelIndex()).thenReturn(0);
+        final Connection connection = createMappableConnection(sourceProcessor, destinationProcessor, processGroup, "connection-ab", Set.of(discardRelationship));
         final AtomicReference<Collection<Relationship>> selectedRelationships = new AtomicReference<>(Set.of(discardRelationship));
         when(connection.getRelationships()).thenAnswer(invocation -> selectedRelationships.get());
         doAnswer(invocation -> {
             selectedRelationships.set(invocation.getArgument(0));
             return null;
         }).when(connection).setRelationships(anyCollection());
-        when(connection.getZIndex()).thenReturn(0L);
-        when(connection.getBendPoints()).thenReturn(Collections.emptyList());
         when(sourceProcessor.getConnections(discardRelationship)).thenReturn(Set.of(connection));
-        when(processGroup.getConnection(connection.getIdentifier())).thenReturn(connection);
-
-        final FlowFileQueue flowFileQueue = connection.getFlowFileQueue();
-        when(flowFileQueue.getBackPressureDataSizeThreshold()).thenReturn("1 GB");
-        when(flowFileQueue.getBackPressureObjectThreshold()).thenReturn(10000L);
-        when(flowFileQueue.getFlowFileExpiration()).thenReturn("0 sec");
-        when(flowFileQueue.getPriorities()).thenReturn(Collections.emptyList());
-        when(flowFileQueue.getLoadBalanceStrategy()).thenReturn(LoadBalanceStrategy.DO_NOT_LOAD_BALANCE);
-        when(flowFileQueue.getPartitioningAttribute()).thenReturn(null);
-        when(flowFileQueue.getLoadBalanceCompression()).thenReturn(LoadBalanceCompression.DO_NOT_COMPRESS);
 
         when(processGroup.getProcessors()).thenReturn(List.of(sourceProcessor, destinationProcessor));
         when(flowManager.getProcessorNode(sourceProcessor.getIdentifier())).thenReturn(sourceProcessor);
@@ -834,6 +833,235 @@ public class StandardVersionedComponentSynchronizerTest {
             new StaticDifferenceDescriptor(), Function.identity(), VersionedComponent::getIdentifier, FlowComparatorVersionedStrategy.DEEP);
         assertFalse(comparator.compare().getDifferences().stream()
             .anyMatch(difference -> difference.getDifferenceType() == DifferenceType.AUTO_TERMINATED_RELATIONSHIPS_CHANGED));
+    }
+
+    @Test
+    public void testPersistedFlowRestoreLeavesServiceReferencingProcessorUnchanged() {
+        final ServiceReferencingFlow flow = createServiceReferencingFlow();
+
+        restorePersistedFlow(flow.processGroup(), mapPersistedFlow(flow.processGroup()));
+
+        verify(flow.processor(), never()).setProperties(anyMap(), anyBoolean(), anySet());
+        verify(flow.processGroup(), never()).stopProcessor(flow.processor());
+    }
+
+    @Test
+    public void testPersistedFlowRestoreRetainsServiceReferencingParameterValue() {
+        final ServiceReferencingFlow flow = createServiceReferencingFlow();
+        final String serviceId = flow.service().getIdentifier();
+
+        // A Connector's managed Parameter Context is not registered with the ParameterContextManager
+        final ParameterContext parameterContext = new StandardParameterContext.Builder()
+            .id("managed-parameter-context")
+            .name("Managed Parameter Context")
+            .parameterReferenceManager(parameterReferenceManager)
+            .build();
+        parameterContext.setParameters(Map.of(SERVICE_PARAMETER_NAME, new Parameter.Builder().name(SERVICE_PARAMETER_NAME).value(serviceId).build()));
+        when(flow.processGroup().getParameterContext()).thenReturn(parameterContext);
+        final ParameterReferencedControllerServiceData referenceData = new ParameterReferencedControllerServiceData(SERVICE_PARAMETER_NAME, flow.processor(),
+            SERVICE_PROPERTY, ControllerService.class, SERVICE_VERSIONED_ID);
+        when(parameterReferenceManager.getReferencedControllerServiceData(parameterContext, SERVICE_PARAMETER_NAME)).thenReturn(List.of(referenceData));
+
+        restorePersistedFlow(flow.processGroup(), mapPersistedFlow(flow.processGroup()));
+
+        final ParameterDescriptor serviceParameterDescriptor = new ParameterDescriptor.Builder().name(SERVICE_PARAMETER_NAME).build();
+        assertEquals(serviceId, parameterContext.getParameter(serviceParameterDescriptor).orElseThrow().getValue());
+    }
+
+    @Test
+    public void testPersistedFlowRestoreTreatsBundleVersionChangeAsUpdate() throws Exception {
+        final ProcessGroup processGroup = createPersistedProcessGroup();
+        final ControllerServiceNode service = createPersistedControllerService(processGroup);
+        final ProcessorNode sourceProcessor = createPersistedProcessor(processGroup, "source-processor");
+        final ProcessorNode destinationProcessor = createPersistedProcessor(processGroup, "destination-processor");
+        when(processGroup.getProcessors()).thenReturn(List.of(sourceProcessor, destinationProcessor));
+
+        final Relationship successRelationship = new Relationship.Builder().name("success").build();
+        when(sourceProcessor.getRelationships()).thenReturn(Set.of(successRelationship));
+        when(sourceProcessor.getRelationship("success")).thenReturn(successRelationship);
+        final Connection connection = createMappableConnection(sourceProcessor, destinationProcessor, processGroup, "connection-ab", Set.of(successRelationship));
+        queuesWithData.add(connection.getFlowFileQueue().getIdentifier());
+
+        final VersionedProcessGroup persistedGroup = mapPersistedFlow(processGroup);
+        final Bundle otherVersionBundle = new Bundle("group", "artifact", "version 2.0");
+        persistedGroup.getProcessors().forEach(processor -> processor.setBundle(otherVersionBundle));
+        persistedGroup.getControllerServices().forEach(controllerService -> controllerService.setBundle(otherVersionBundle));
+
+        restorePersistedFlow(processGroup, persistedGroup);
+
+        final BundleCoordinate otherVersionCoordinate = new BundleCoordinate("group", "artifact", "version 2.0");
+        verify(reloadComponent).reload(eq(sourceProcessor), anyString(), eq(otherVersionCoordinate), anySet());
+        verify(reloadComponent).reload(eq(destinationProcessor), anyString(), eq(otherVersionCoordinate), anySet());
+        verify(reloadComponent).reload(eq(service), anyString(), eq(otherVersionCoordinate), anySet());
+        verify(processGroup, never()).removeProcessor(any());
+        verify(processGroup, never()).addProcessor(any());
+        verify(processGroup, never()).removeControllerService(any());
+        verify(processGroup, never()).addControllerService(any());
+        verify(processGroup, never()).removeConnection(any());
+        verify(processGroup, never()).addConnection(any());
+    }
+
+    @Test
+    public void testPersistedFlowRestoreIgnoresUnchangedSensitiveProperty() {
+        final ProcessGroup processGroup = createPersistedProcessGroup();
+        final ProcessorNode processor = createPersistedProcessor(processGroup, "sensitive-processor");
+        final PropertyDescriptor sensitiveProperty = new PropertyDescriptor.Builder().name(SENSITIVE_PROPERTY_NAME).sensitive(true).build();
+        stubProperties(processor, Map.of(sensitiveProperty, DECRYPTED_TEXT));
+        when(processGroup.getProcessors()).thenReturn(List.of(processor));
+
+        restorePersistedFlow(processGroup, mapPersistedFlow(processGroup));
+
+        verify(processor, never()).setProperties(anyMap(), anyBoolean(), anySet());
+        verify(processGroup, never()).stopProcessor(processor);
+    }
+
+    @Test
+    public void testPersistedFlowRestoreUpdatesUpgradedProcessorInPlace() {
+        final ProcessGroup processGroup = createPersistedProcessGroup();
+        final ProcessorNode processor = createPersistedProcessor(processGroup, "upgraded-processor");
+        final PropertyDescriptor existingProperty = new PropertyDescriptor.Builder().name("Existing Property").build();
+        stubProperties(processor, Map.of(existingProperty, "configured value"));
+        when(processGroup.getProcessors()).thenReturn(List.of(processor));
+
+        final VersionedProcessGroup persistedGroup = mapPersistedFlow(processGroup);
+        persistedGroup.getProcessors().forEach(versionedProcessor -> versionedProcessor.setPosition(new Position(100D, 100D)));
+
+        // A NAR upgrade added a property with a default value that the persisted flow predates, so the restore clears it back to its default
+        final PropertyDescriptor addedProperty = new PropertyDescriptor.Builder().name("Added Property").defaultValue("default value").build();
+        final Map<PropertyDescriptor, String> upgradedProperties = new HashMap<>();
+        upgradedProperties.put(existingProperty, "configured value");
+        upgradedProperties.put(addedProperty, null);
+        stubProperties(processor, upgradedProperties);
+
+        restorePersistedFlow(processGroup, persistedGroup);
+
+        final Map<String, String> expectedProperties = new HashMap<>();
+        expectedProperties.put(existingProperty.getName(), "configured value");
+        expectedProperties.put(addedProperty.getName(), null);
+        verify(processor).setProperties(eq(expectedProperties), eq(true), anySet());
+        verify(processor).setPosition(argThat(position -> position.getX() == 100D && position.getY() == 100D));
+        verify(processGroup, never()).removeProcessor(any());
+        verify(processGroup, never()).addProcessor(any());
+    }
+
+    private ServiceReferencingFlow createServiceReferencingFlow() {
+        final ProcessGroup processGroup = createPersistedProcessGroup();
+        final ControllerServiceNode service = createPersistedControllerService(processGroup);
+        final ProcessorNode processor = createPersistedProcessor(processGroup, "service-referencing-processor");
+        stubProperties(processor, Map.of(SERVICE_PROPERTY, service.getIdentifier()));
+        when(processGroup.getProcessors()).thenReturn(List.of(processor));
+        return new ServiceReferencingFlow(processGroup, processor, service);
+    }
+
+    private ProcessGroup createPersistedProcessGroup() {
+        final ProcessGroup processGroup = createMockProcessGroup();
+        final String groupId = processGroup.getIdentifier();
+        when(processGroup.getVersionedComponentId()).thenReturn(Optional.of(groupId));
+        when(flowManager.getGroup(groupId)).thenReturn(processGroup);
+        return processGroup;
+    }
+
+    private ProcessorNode createPersistedProcessor(final ProcessGroup processGroup, final String versionedId) {
+        final ProcessorNode processor = createMappableProcessor(processGroup);
+        final String groupId = processGroup.getIdentifier();
+        when(processor.getVersionedComponentId()).thenReturn(Optional.of(versionedId));
+        when(processor.getProcessGroupIdentifier()).thenReturn(groupId);
+        when(flowManager.getProcessorNode(processor.getIdentifier())).thenReturn(processor);
+        return processor;
+    }
+
+    private ControllerServiceNode createPersistedControllerService(final ProcessGroup processGroup) {
+        final ControllerServiceNode service = createMockControllerService();
+        final String groupId = processGroup.getIdentifier();
+        when(service.getProcessGroup()).thenReturn(processGroup);
+        when(service.getProcessGroupIdentifier()).thenReturn(groupId);
+        when(service.getVersionedComponentId()).thenReturn(Optional.of(SERVICE_VERSIONED_ID));
+        when(service.getName()).thenReturn("Service");
+        when(service.getCanonicalClassName()).thenReturn("org.apache.nifi.controller.TestService");
+        when(processGroup.getControllerServices(false)).thenReturn(Set.of(service));
+        when(controllerServiceProvider.getControllerServiceNode(service.getIdentifier())).thenReturn(service);
+        when(flowManager.getControllerServiceNode(service.getIdentifier())).thenReturn(service);
+        return service;
+    }
+
+    private void stubProperties(final ComponentNode component, final Map<PropertyDescriptor, String> propertyValues) {
+        final Map<PropertyDescriptor, PropertyConfiguration> configurations = new HashMap<>();
+        for (final Map.Entry<PropertyDescriptor, String> entry : propertyValues.entrySet()) {
+            final PropertyDescriptor descriptor = entry.getKey();
+            final PropertyConfiguration configuration = new PropertyConfiguration(entry.getValue(), null, null, null);
+            configurations.put(descriptor, configuration);
+            when(component.getProperty(descriptor)).thenReturn(configuration);
+            when(component.getRawPropertyValue(descriptor)).thenReturn(entry.getValue());
+            when(component.getEffectivePropertyValue(descriptor)).thenReturn(entry.getValue());
+            when(component.getPropertyDescriptor(descriptor.getName())).thenReturn(descriptor);
+        }
+
+        when(component.getProperties()).thenReturn(configurations);
+        when(component.getRawPropertyValues()).thenReturn(propertyValues);
+    }
+
+    private Connection createMappableConnection(final ProcessorNode source, final ProcessorNode destination, final ProcessGroup processGroup, final String versionedId,
+                                                final Set<Relationship> relationships) {
+        final Connection connection = createMockConnection(source, destination, processGroup);
+        when(connection.getVersionedComponentId()).thenReturn(Optional.of(versionedId));
+        when(connection.getName()).thenReturn(versionedId);
+        when(connection.getLabelIndex()).thenReturn(0);
+        when(connection.getRelationships()).thenReturn(relationships);
+        when(connection.getZIndex()).thenReturn(0L);
+        when(connection.getBendPoints()).thenReturn(Collections.emptyList());
+        when(processGroup.getConnection(connection.getIdentifier())).thenReturn(connection);
+
+        final FlowFileQueue flowFileQueue = connection.getFlowFileQueue();
+        when(flowFileQueue.getBackPressureDataSizeThreshold()).thenReturn("1 GB");
+        when(flowFileQueue.getBackPressureObjectThreshold()).thenReturn(10000L);
+        when(flowFileQueue.getFlowFileExpiration()).thenReturn("0 sec");
+        when(flowFileQueue.getPriorities()).thenReturn(Collections.emptyList());
+        when(flowFileQueue.getLoadBalanceStrategy()).thenReturn(LoadBalanceStrategy.DO_NOT_LOAD_BALANCE);
+        when(flowFileQueue.getPartitioningAttribute()).thenReturn(null);
+        when(flowFileQueue.getLoadBalanceCompression()).thenReturn(LoadBalanceCompression.DO_NOT_COMPRESS);
+        return connection;
+    }
+
+    private VersionedProcessGroup mapPersistedFlow(final ProcessGroup processGroup) {
+        final VersionedComponentFlowMapper mapper = VersionedComponentFlowMapper.forPersistedFlow(mock(ExtensionManager.class),
+            new InternalPassThroughPropertyEncryptionProvider(), VersionedComponentStateLookup.IDENTITY_LOOKUP);
+        return mapper.mapNonVersionedProcessGroup(processGroup, controllerServiceProvider);
+    }
+
+    /**
+     * Synchronizes the group the same way StandardProcessGroup.restoreFlowPreservingIdentifiers does: persisted-flow mapping options,
+     * instance identifiers kept, and components compared by instance identifier.
+     */
+    private void restorePersistedFlow(final ProcessGroup processGroup, final VersionedProcessGroup persistedGroup) {
+        final VersionedFlowSynchronizationContext context = new VersionedFlowSynchronizationContext.Builder()
+            .componentIdGenerator((proposedId, instanceId, destinationGroupId) -> instanceId)
+            .componentScheduler(componentScheduler)
+            .extensionManager(mock(ExtensionManager.class))
+            .flowManager(flowManager)
+            .controllerServiceProvider(controllerServiceProvider)
+            .flowMappingOptions(FlowMappingOptions.forPersistedFlow(new InternalPassThroughPropertyEncryptionProvider(), VersionedComponentStateLookup.IDENTITY_LOOKUP))
+            .processContextFactory(processor -> mock(ProcessContext.class))
+            .configurationContextFactory(node -> null)
+            .reloadComponent(reloadComponent)
+            .assetManager(mock(AssetManager.class))
+            .build();
+
+        final FlowSynchronizationOptions options = new FlowSynchronizationOptions.Builder()
+            .componentIdGenerator((proposedId, instanceId, destinationGroupId) -> instanceId)
+            .componentComparisonIdLookup(VersionedComponent::getInstanceIdentifier)
+            .componentScheduler(componentScheduler)
+            .scheduledStateChangeListener(scheduledStateChangeListener)
+            .ignoreLocalModifications(true)
+            .updateDescendantVersionedFlows(true)
+            .updateGroupSettings(true)
+            .updateRpgUrls(false)
+            .propertyEncryptionProvider(new InternalPassThroughPropertyEncryptionProvider())
+            .build();
+
+        final VersionedExternalFlow externalFlow = new VersionedExternalFlow();
+        externalFlow.setFlowContents(persistedGroup);
+        externalFlow.setParameterContexts(Map.of());
+        new StandardVersionedComponentSynchronizer(context).synchronize(processGroup, externalFlow, options);
     }
 
     @Test
@@ -2246,6 +2474,9 @@ public class StandardVersionedComponentSynchronizerTest {
     }
 
     private record ControllerServiceStateUpdate(ControllerServiceNode controllerService, ControllerServiceState state) {
+    }
+
+    private record ServiceReferencingFlow(ProcessGroup processGroup, ProcessorNode processor, ControllerServiceNode service) {
     }
 
     private class CapturingScheduledStateChangeListener implements ScheduledStateChangeListener {

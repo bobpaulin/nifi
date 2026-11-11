@@ -124,9 +124,9 @@ public abstract class AbstractNarSwapMigrationIT extends NiFiSystemIT {
 
     /**
      * Standalone instances report a single directory. A cluster's aggregate instance has no directory of its own,
-     * so the NAR swap has to visit each node.
+     * so callers have to visit each node.
      */
-    private List<File> instanceDirectories() {
+    protected List<File> instanceDirectories() {
         final NiFiInstance instance = getNiFiInstance();
         if (instance.getNumberOfNodes() <= 1) {
             return List.of(instance.getInstanceDirectory());

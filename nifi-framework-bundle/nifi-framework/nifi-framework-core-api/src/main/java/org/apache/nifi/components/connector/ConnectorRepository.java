@@ -125,7 +125,7 @@ public interface ConnectorRepository {
 
     /**
      * Starts the given Connector, managing any appropriate lifecycle events.
-     * When a flow evolution is pending, the context persists the flow after phase one is applied, after the connector starts, and when the evolution fails.
+     * When a flow evolution is pending, the context persists the flow once, after the upgraded flow is applied. A failed evolution is not persisted.
      * The context is required even when no evolution is pending.
      *
      * @param connector the Connector to start

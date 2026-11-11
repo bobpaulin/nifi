@@ -107,7 +107,7 @@ final class MigrationFlowContext implements FrameworkFlowContext {
     @Override
     public void restorePersistedFlow(final VersionedProcessGroup persistedFlow, final VersionedParameterContext parameterContext) {
         throw new IllegalStateException("restorePersistedFlow() cannot be called from MigratableConnector.migrateConfiguration() or migrateState();"
-                + " the migration context exposes a read-only view of the managed flow so that the framework remains the sole owner of" + " installing the managed Process Group.");
+                + " the migration context exposes a read-only view of the managed flow so that the framework remains the sole owner of installing the managed Process Group.");
     }
 
     @Override

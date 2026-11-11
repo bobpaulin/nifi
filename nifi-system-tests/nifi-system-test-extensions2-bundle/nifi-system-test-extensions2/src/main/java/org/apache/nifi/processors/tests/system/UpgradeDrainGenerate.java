@@ -16,7 +16,11 @@
  */
 package org.apache.nifi.processors.tests.system;
 
+import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.state.Scope;
+import org.apache.nifi.components.state.StateMap;
+import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
@@ -26,14 +30,19 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * Generates FlowFiles for connector-upgrade tests. It lives in a NAR that the upgrade swap does not remove,
  * so a restored pre-upgrade flow can still run after the connector NAR changes.
  */
+@Stateful(scopes = Scope.LOCAL, description = "Stores the number of generated FlowFiles under the key " + UpgradeDrainGenerate.COUNT_KEY)
 public class UpgradeDrainGenerate extends AbstractProcessor {
+
+    public static final String COUNT_KEY = "count";
 
     public static final PropertyDescriptor FILE_SIZE = new PropertyDescriptor.Builder()
         .name("File Size")
@@ -57,6 +66,13 @@ public class UpgradeDrainGenerate extends AbstractProcessor {
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
+    public static final PropertyDescriptor MARKER_SERVICE = new PropertyDescriptor.Builder()
+        .name("Marker Service")
+        .description("Optional Controller Service reference. A Connector enables only referenced services when it starts.")
+        .required(false)
+        .identifiesControllerService(ControllerService.class)
+        .build();
+
     public static final Relationship SUCCESS = new Relationship.Builder()
         .name("success")
         .description("Generated FlowFiles")
@@ -64,7 +80,7 @@ public class UpgradeDrainGenerate extends AbstractProcessor {
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
-        return List.of(FILE_SIZE, GATE_FILE, SECRET_VALUE);
+        return List.of(FILE_SIZE, GATE_FILE, SECRET_VALUE, MARKER_SERVICE);
     }
 
     @Override
@@ -83,5 +99,14 @@ public class UpgradeDrainGenerate extends AbstractProcessor {
         FlowFile flowFile = session.create();
         flowFile = session.write(flowFile, out -> out.write('x'));
         session.transfer(flowFile, SUCCESS);
+
+        try {
+            final StateMap stateMap = session.getState(Scope.LOCAL);
+            final String countValue = stateMap.get(COUNT_KEY);
+            final long count = countValue == null ? 0L : Long.parseLong(countValue);
+            session.setState(Map.of(COUNT_KEY, String.valueOf(count + 1)), Scope.LOCAL);
+        } catch (final IOException e) {
+            throw new ProcessException("Failed to update the generated FlowFile count", e);
+        }
     }
 }

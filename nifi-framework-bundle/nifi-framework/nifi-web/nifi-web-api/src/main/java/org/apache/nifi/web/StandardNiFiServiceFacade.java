@@ -3804,13 +3804,32 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
             }
 
             switch (desiredState) {
-                case RUNNING -> connector.verifyCanStart();
+                case RUNNING -> {
+                    verifyExpectedConnectorBundle(connector, connectorDTO.getExpectedBundle());
+                    connector.verifyCanStart();
+                }
                 case STOPPED -> {
                     // Stop is valid from any non-Troubleshooting state; no additional verification required.
                 }
                 default -> throw new IllegalArgumentException("Unsupported scheduled state for Connector: " + desiredState);
             }
         }
+    }
+
+    private void verifyExpectedConnectorBundle(final ConnectorNode connector, final BundleDTO expectedBundle) {
+        if (expectedBundle == null) {
+            return;
+        }
+
+        final BundleCoordinate expectedCoordinate = BundleUtils.getBundle(controllerFacade.getExtensionManager(), connector.getCanonicalClassName(), expectedBundle);
+        final BundleCoordinate loadedCoordinate = connector.getBundleCoordinate();
+        if (expectedCoordinate.equals(loadedCoordinate)) {
+            return;
+        }
+
+        throw new IllegalStateException("Cannot start Connector " + connector.getIdentifier()
+                + " because this node loaded " + loadedCoordinate
+                + " but the cluster coordinator expects " + expectedCoordinate);
     }
 
     @Override
@@ -3879,7 +3898,7 @@ public class StandardNiFiServiceFacade implements NiFiServiceFacade {
             }
             // Evolution sets the desired state to RUNNING as soon as it is claimed so a joining node starts too.
             // Persisting that state before the hook succeeds makes a failed evolution auto-start on restart.
-            // The evolution coordinator saves after a successful commit, and a failure puts the desired state back.
+            // The repository saves once the upgraded flow is applied, and a failed evolution puts the desired state back.
             final ConnectorNode scheduled = connectorDAO.getConnector(id, ConnectorSyncMode.LOCAL_ONLY);
             if (scheduled.getCurrentState() != ConnectorState.DRAINING || !scheduled.isPendingFlowEvolution()) {
                 controllerFacade.save();

@@ -23,6 +23,7 @@ import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
 import org.apache.nifi.cluster.coordination.node.NodeConnectionStatus;
 import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.cluster.manager.exception.NoConnectedNodesException;
+import org.apache.nifi.components.connector.ConnectorClusterUnavailableException;
 import org.apache.nifi.components.connector.FlowEvolutionStatus;
 import org.apache.nifi.web.api.dto.ConnectorDTO;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
@@ -32,6 +33,7 @@ import java.io.IOException;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -55,15 +57,15 @@ class TestClusteredConnectorRequestReplicator {
                 () -> requestReplicator, () -> clusterCoordinator, false);
 
         when(clusterCoordinator.isConnected()).thenReturn(false);
-        assertThrows(NoConnectedNodesException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
+        assertThrows(ConnectorClusterUnavailableException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
 
         when(clusterCoordinator.isConnected()).thenReturn(true);
         when(connectionStatus.getState()).thenReturn(NodeConnectionState.CONNECTING);
-        assertThrows(NoConnectedNodesException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
+        assertThrows(ConnectorClusterUnavailableException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
 
         when(connectionStatus.getState()).thenReturn(NodeConnectionState.DISCONNECTED);
         when(connectionStatus.getDisconnectCode()).thenReturn(DisconnectionCode.NOT_YET_CONNECTED);
-        assertThrows(NoConnectedNodesException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
+        assertThrows(ConnectorClusterUnavailableException.class, () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
 
         verify(requestReplicator, never()).replicate(isNull(), eq("GET"), any(), anyMap(), anyMap());
     }
@@ -101,6 +103,24 @@ class TestClusteredConnectorRequestReplicator {
                 () -> requestReplicator, () -> clusterCoordinator, false);
 
         assertEquals(FlowEvolutionStatus.FAILED, replicator.getFlowEvolutionStatus(CONNECTOR_ID));
+    }
+
+    @Test
+    void testReplicateNoConnectedNodesIsTranslated() {
+        final RequestReplicator requestReplicator = mock(RequestReplicator.class);
+        final ClusterCoordinator clusterCoordinator = mock(ClusterCoordinator.class);
+        final NoConnectedNodesException cause = new NoConnectedNodesException();
+
+        when(clusterCoordinator.isConnected()).thenReturn(true);
+        when(clusterCoordinator.getConnectionStatuses()).thenReturn(List.of());
+        when(requestReplicator.replicate(isNull(), eq("GET"), any(), anyMap(), anyMap())).thenThrow(cause);
+
+        final ClusteredConnectorRequestReplicator replicator = new ClusteredConnectorRequestReplicator(
+                () -> requestReplicator, () -> clusterCoordinator, false);
+
+        final ConnectorClusterUnavailableException failure = assertThrows(ConnectorClusterUnavailableException.class,
+                () -> replicator.getFlowEvolutionStatus(CONNECTOR_ID));
+        assertSame(cause, failure.getCause());
     }
 
     private static ConnectorEntity connectorEntity(final FlowEvolutionStatus status) {

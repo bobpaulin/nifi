@@ -41,6 +41,7 @@ public class ConnectorDTO extends ComponentDTO {
     private Boolean multipleVersionsAvailable;
     private Boolean extensionMissing;
     private Boolean supportsBacklogReporting;
+    private BundleDTO expectedBundle;
 
     private String configurationUrl;
     private String detailsUrl;
@@ -83,7 +84,7 @@ public class ConnectorDTO extends ComponentDTO {
     }
 
     @Schema(description = "The local or merged progress of a pending Connector flow evolution.",
-            allowableValues = {"INACTIVE", "PHASE_ONE_PENDING", "PHASE_ONE_COMPLETE", "PHASE_TWO_COMPLETE", "FAILED"},
+            allowableValues = {"INACTIVE", "EVOLVE_DRAIN_PENDING", "EVOLVE_DRAIN_COMPLETE", "FAILED"},
             accessMode = Schema.AccessMode.READ_ONLY)
     public String getFlowEvolutionStatus() {
         return flowEvolutionStatus;
@@ -184,6 +185,16 @@ public class ConnectorDTO extends ComponentDTO {
 
     public void setSupportsBacklogReporting(final Boolean supportsBacklogReporting) {
         this.supportsBacklogReporting = supportsBacklogReporting;
+    }
+
+    @Schema(description = "The Connector bundle expected by the cluster coordinator when verifying a START. "
+            + "Not persisted; used only for cluster run-status verification.")
+    public BundleDTO getExpectedBundle() {
+        return expectedBundle;
+    }
+
+    public void setExpectedBundle(final BundleDTO expectedBundle) {
+        this.expectedBundle = expectedBundle;
     }
 
     @Schema(description = "The available actions that can be performed on this Connector.")

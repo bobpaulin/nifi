@@ -166,19 +166,7 @@ public class VersionedComponentFlowMapper {
 
     public static VersionedComponentFlowMapper forPersistedFlow(final ExtensionManager extensionManager,
             final PropertyEncryptionProvider propertyEncryptionProvider, final VersionedComponentStateLookup stateLookup) {
-        final FlowMappingOptions mappingOptions = new FlowMappingOptions.Builder()
-            .mapSensitiveConfiguration(true)
-            .mapPropertyDescriptors(false)
-            .stateLookup(stateLookup)
-            .propertyEncryptionProvider(propertyEncryptionProvider)
-            .componentIdLookup(ComponentIdLookup.VERSIONED_OR_GENERATE)
-            .mapInstanceIdentifiers(true)
-            .mapControllerServiceReferencesToVersionedId(false)
-            .mapFlowRegistryClientId(true)
-            .mapAssetReferences(true)
-            .build();
-
-        return new VersionedComponentFlowMapper(extensionManager, mappingOptions);
+        return new VersionedComponentFlowMapper(extensionManager, FlowMappingOptions.forPersistedFlow(propertyEncryptionProvider, stateLookup));
     }
 
     /**

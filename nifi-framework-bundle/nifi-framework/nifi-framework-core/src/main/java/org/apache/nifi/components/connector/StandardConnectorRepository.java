@@ -187,7 +187,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
         final boolean isNewConnector = connector == null;
         if (isNewConnector) {
             connector = createConnectorNode(versionedConnector);
-            connectors.put(connector.getIdentifier(), connector);
+            connectors.put(connectorId, connector);
             logger.info("Created new connector node [{}] of type [{}]", connectorId, versionedConnector.getType());
         }
 
@@ -255,7 +255,8 @@ public class StandardConnectorRepository implements ConnectorRepository {
         final boolean restoringTroubleshooting = effectiveScheduledState == VersionedConnectorState.TROUBLESHOOTING;
         // inheritConfiguration rebuilds the managed group from the loaded bundle. After a NAR upgrade the persisted
         // group still belongs to the previous bundle and may hold the queues the evolution hook has to drain, so that
-        // group has to be restored instead of rebuilt.
+        // group has to be installed instead of rebuilt. On a same-bundle restart the rebuild is kept and only the
+        // persisted snapshot is adopted.
         final boolean evolutionPending;
         try {
             evolutionPending = connector.restorePendingFlowEvolution(versionedConnector, effectiveActiveConfig, effectiveWorkingConfig);
@@ -282,6 +283,8 @@ public class StandardConnectorRepository implements ConnectorRepository {
         // so the Connector-supplied parameter values remain available. The transient Connector-supplied flow shape is
         // invisible outside this synchronization cycle: flow synchronization completes before the FlowFile Repository
         // attaches FlowFiles to queues, so no FlowFile movement can observe it.
+        //
+        // A same-bundle restart that is not troubleshooting keeps the rebuilt flow and only adopts the snapshot.
         if (configChanged || restoringTroubleshooting) {
             logger.info("{} configuration needs synchronization", connector);
             try {
@@ -358,7 +361,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
         ConnectorNode node = connectors.get(connectorId);
         if (node == null) {
             node = createConnectorNode(versionedConnector);
-            connectors.put(node.getIdentifier(), node);
+            connectors.put(connectorId, node);
             logger.info("Created connector node [{}] for reject/error handling", connectorId);
         }
         return node;
@@ -661,9 +664,9 @@ public class StandardConnectorRepository implements ConnectorRepository {
     private void evolveThenStart(final ConnectorNode connector, final CompletableFuture<Void> evolutionFuture, final ConnectorUpdateContext persistenceContext) {
         boolean startAttempted = false;
         try {
-            runFlowEvolution(connector, persistenceContext);
+            final Future<Void> startFuture = runFlowEvolution(connector, persistenceContext);
             startAttempted = true;
-            startEvolvedConnector(connector, persistenceContext);
+            startFuture.get();
             evolutionFuture.complete(null);
         } catch (final Throwable failure) {
             if (failure instanceof InterruptedException) {
@@ -671,7 +674,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
             }
 
             logger.error("Flow evolution failed for {}", connector, failure);
-            handleFlowEvolutionFailure(connector, evolutionFuture, failure, startAttempted, persistenceContext);
+            handleFlowEvolutionFailure(connector, evolutionFuture, failure, startAttempted);
 
             if (failure instanceof final Error error) {
                 throw error;
@@ -681,26 +684,31 @@ public class StandardConnectorRepository implements ConnectorRepository {
         }
     }
 
-    private void runFlowEvolution(final ConnectorNode connector, final ConnectorUpdateContext persistenceContext) throws Throwable {
-        // Read before the drain. The drain advances the status, and a stop that arrived first already reports FAILED.
-        final boolean hookComplete = connector.getFlowEvolutionStatus() == FlowEvolutionStatus.PHASE_ONE_COMPLETE;
-        if (!hookComplete) {
-            waitForFlowEvolutionStatus(connector, FlowEvolutionStatus.PHASE_ONE_PENDING);
-        }
-
+    /**
+     * Runs the evolve-drain phase of the evolution, then applies the upgraded flow as a configuration update.
+     *
+     * @return the future for starting the evolved connector
+     */
+    private Future<Void> runFlowEvolution(final ConnectorNode connector, final ConnectorUpdateContext persistenceContext) throws Throwable {
         awaitFlowEvolutionDrain(connector, connector.evolveFlow(flowEvolutionCoordinatorExecutor));
-        if (!hookComplete) {
-            waitForFlowEvolutionStatus(connector, FlowEvolutionStatus.PHASE_ONE_COMPLETE);
-        }
 
-        connector.applyUpdate();
-        persistenceContext.saveFlow();
-        waitForFlowEvolutionStatus(connector, FlowEvolutionStatus.PHASE_TWO_COMPLETE);
+        // No node applies the upgraded flow until every node that still has the outgoing flow has drained it.
+        waitForFlowEvolutionStatus(connector);
+
+        // Every node has drained, so as at startup the preparation is local and no cluster-wide wait for UPDATING is needed.
+        // A peer that has not yet observed the drain barrier may still be DRAINING or preparing.
+        connector.beginEvolvedFlowUpdate();
+        connector.prepareForUpdate();
+        completeUpdate(connector, persistenceContext, Set.of(ConnectorState.PREPARING_FOR_UPDATE, ConnectorState.UPDATING, ConnectorState.DRAINING));
+
+        // The connector stayed desired RUNNING throughout the evolution, so the flow saved after the apply already records it as running.
+        logger.info("{} has been successfully evolved; starting", connector);
+        return connector.start(lifecycleExecutor);
     }
 
     private void awaitFlowEvolutionDrain(final ConnectorNode connector, final Future<Void> future) throws Throwable {
         try {
-            future.get(TimeUnit.NANOSECONDS.convert(flowEvolutionDrainTimeout), TimeUnit.NANOSECONDS);
+            future.get(flowEvolutionDrainTimeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (final TimeoutException e) {
             final FlowUpdateException timedOut = new FlowUpdateException("Flow evolution drain timed out for " + connector, e);
             connector.abortUpdate(timedOut);
@@ -719,12 +727,6 @@ public class StandardConnectorRepository implements ConnectorRepository {
         }
     }
 
-    private void startEvolvedConnector(final ConnectorNode connector, final ConnectorUpdateContext persistenceContext) throws Throwable {
-        final Future<Void> startFuture = connector.start(lifecycleExecutor);
-        startFuture.get();
-        persistenceContext.saveFlow();
-    }
-
     private static Duration canonicalFlowEvolutionDrainTimeout(final Duration timeout) {
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
             return DEFAULT_FLOW_EVOLUTION_DRAIN_TIMEOUT;
@@ -734,21 +736,19 @@ public class StandardConnectorRepository implements ConnectorRepository {
     }
 
     private void handleFlowEvolutionFailure(final ConnectorNode connector, final CompletableFuture<Void> evolutionFuture,
-            final Throwable failure, final boolean startAttempted, final ConnectorUpdateContext persistenceContext) {
-        try {
-            if (startAttempted) {
-                connector.stop(lifecycleExecutor);
-            } else {
+            final Throwable failure, final boolean startAttempted) {
+        // A failed evolution is not saved; the persisted flow stays as it was last saved until the connector is corrected.
+        // A failed start of the evolved connector is an ordinary failed start, because the upgraded flow has already been saved.
+        if (!startAttempted) {
+            try {
+                // While DRAINING this fails the evolution. Once preparation for the upgraded flow has begun it leaves UPDATE_FAILED.
                 connector.abortUpdate(failure);
+                if (connector.getCurrentState() == ConnectorState.STOPPING && connector instanceof final StandardConnectorNode standardConnector) {
+                    standardConnector.retryPreUpgradeStop(lifecycleExecutor);
+                }
+            } catch (final Throwable cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
             }
-        } catch (final Throwable cleanupFailure) {
-            failure.addSuppressed(cleanupFailure);
-        }
-
-        try {
-            persistenceContext.saveFlow();
-        } catch (final Throwable persistenceFailure) {
-            failure.addSuppressed(persistenceFailure);
         }
 
         evolutionFuture.completeExceptionally(failure);
@@ -841,17 +841,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
             logger.debug("Waiting for {} to transition to UPDATING state", connector);
             waitForState(connector, Set.of(ConnectorState.UPDATING), Set.of(ConnectorState.PREPARING_FOR_UPDATE));
 
-            // Apply the update to the connector.
-            logger.info("{} has now completed preparations for update; applying update now", connector);
-            connector.applyUpdate();
-            logger.info("{} has successfully applied update", connector);
-
-            // Now that the update has been applied, save the flow so that the updated configuration is persisted.
-            context.saveFlow();
-
-            // Wait for all nodes to complete the update.
-            waitForState(connector, Set.of(ConnectorState.UPDATED), Set.of(ConnectorState.UPDATING));
-            logger.info("{} has successfully completed update on all nodes", connector);
+            completeUpdate(connector, context, Set.of(ConnectorState.UPDATING));
 
             // If the initial desired state was RUNNING, start the connector again. Otherwise, stop it.
             // We don't simply leave it be as the prepareForUpdate / update may have changed the state of some components.
@@ -871,6 +861,26 @@ public class StandardConnectorRepository implements ConnectorRepository {
         }
     }
 
+    /**
+     * Applies and saves an update for a connector that is UPDATING, then waits for every connected node to reach UPDATED.
+     *
+     * @param allowableWhileWaiting cluster states that may be observed while waiting for UPDATED
+     */
+    private void completeUpdate(final ConnectorNode connector, final ConnectorUpdateContext context, final Set<ConnectorState> allowableWhileWaiting)
+            throws FlowUpdateException, IOException, InterruptedException {
+        // Apply the update to the connector.
+        logger.info("{} has now completed preparations for update; applying update now", connector);
+        connector.applyUpdate();
+        logger.info("{} has successfully applied update", connector);
+
+        // Now that the update has been applied, save the flow so that the updated configuration is persisted.
+        context.saveFlow();
+
+        // Wait for all nodes to complete the update.
+        waitForState(connector, Set.of(ConnectorState.UPDATED), allowableWhileWaiting);
+        logger.info("{} has successfully completed update on all nodes", connector);
+    }
+
     private void waitForState(final ConnectorNode connector, final Set<ConnectorState> desiredStates, final Set<ConnectorState> allowableStates)
                 throws FlowUpdateException, IOException, InterruptedException {
 
@@ -880,13 +890,10 @@ public class StandardConnectorRepository implements ConnectorRepository {
         while (true) {
             final ConnectorState clusterState;
             try {
-                clusterState = requestReplicator.getState(connector.getIdentifier());
-            } catch (final RuntimeException e) {
+                clusterState = requestReplicator == null ? connector.getCurrentState() : requestReplicator.getState(connector.getIdentifier());
+            } catch (final ConnectorClusterUnavailableException e) {
                 // A connector that resumes during startup reaches this barrier before every node has joined.
-                // Replication then fails, or reports only the nodes that are already connected. That is not an evolution failure; wait and retry.
-                if (!isNoConnectedNodes(e)) {
-                    throw e;
-                }
+                // Replication then fails, or reports only the nodes that are already connected. Wait and retry.
 
                 final long elapsedSeconds = Duration.ofNanos(System.nanoTime() - startNanos).toSeconds();
                 if (++iterations % 10 == 0) {
@@ -918,23 +925,29 @@ public class StandardConnectorRepository implements ConnectorRepository {
         }
     }
 
-    private void waitForFlowEvolutionStatus(final ConnectorNode connector, final FlowEvolutionStatus desiredStatus)
-            throws FlowUpdateException, IOException, InterruptedException {
+    private void waitForFlowEvolutionStatus(final ConnectorNode connector) throws FlowUpdateException, IOException, InterruptedException {
         int pollIndex = 0;
+        final long startNanos = System.nanoTime();
+        long lastInfoLogNanos = 0L;
         while (true) {
             if (connector.getFlowEvolutionStatus() == FlowEvolutionStatus.FAILED) {
                 throw new FlowUpdateException("Flow evolution was cancelled for " + connector);
             }
 
+            // A peer reports the FAILED status of an earlier attempt until the replicated START reaches it.
             if (requestReplicator != null) {
                 sleepForFlowEvolutionPoll(pollIndex++);
             }
+
             final FlowEvolutionStatus clusterStatus;
             try {
                 clusterStatus = getFlowEvolutionStatus(connector);
-            } catch (final RuntimeException e) {
-                if (!isNoConnectedNodes(e)) {
-                    throw e;
+            } catch (final ConnectorClusterUnavailableException e) {
+                final long nowNanos = System.nanoTime();
+                if (shouldLogFlowEvolutionWait(lastInfoLogNanos, nowNanos)) {
+                    final long elapsedSeconds = Duration.ofNanos(nowNanos - startNanos).toSeconds();
+                    logger.info("Waiting for {} to join the cluster before checking flow evolution status; elapsed time = {} secs", connector, elapsedSeconds);
+                    lastInfoLogNanos = nowNanos;
                 }
                 continue;
             }
@@ -942,23 +955,30 @@ public class StandardConnectorRepository implements ConnectorRepository {
             if (clusterStatus == FlowEvolutionStatus.FAILED) {
                 throw new FlowUpdateException("Flow evolution failed on at least one cluster node for " + connector);
             }
-            if (clusterStatus.ordinal() >= desiredStatus.ordinal()) {
+            if (clusterStatus == FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE) {
                 logger.info("Flow evolution status for {} is now {}", connector, clusterStatus);
                 return;
             }
 
-            logger.debug("Waiting for {} flow evolution status to become {}; current status is {}",
-                    connector, desiredStatus, clusterStatus);
+            final long nowNanos = System.nanoTime();
+            final long elapsedSeconds = Duration.ofNanos(nowNanos - startNanos).toSeconds();
+            if (shouldLogFlowEvolutionWait(lastInfoLogNanos, nowNanos)) {
+                logger.info("Waiting for {} flow evolution status to become {}; current status is {}; elapsed time = {} secs",
+                        connector, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE, clusterStatus, elapsedSeconds);
+                lastInfoLogNanos = nowNanos;
+            } else {
+                logger.debug("Waiting for {} flow evolution status to become {}; current status is {}",
+                        connector, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE, clusterStatus);
+            }
         }
     }
 
-    private void sleepForFlowEvolutionPoll(final int pollIndex) throws InterruptedException {
-        final Duration interval = FLOW_EVOLUTION_POLL_INTERVALS.get(Math.min(pollIndex, FLOW_EVOLUTION_POLL_INTERVALS.size() - 1));
-        TimeUnit.NANOSECONDS.sleep(interval.toNanos());
+    private static boolean shouldLogFlowEvolutionWait(final long lastInfoLogNanos, final long nowNanos) {
+        return lastInfoLogNanos == 0L || nowNanos - lastInfoLogNanos >= Duration.ofMinutes(1).toNanos();
     }
 
-    private static boolean isNoConnectedNodes(final RuntimeException failure) {
-        return "org.apache.nifi.cluster.manager.exception.NoConnectedNodesException".equals(failure.getClass().getName());
+    private void sleepForFlowEvolutionPoll(final int pollIndex) throws InterruptedException {
+        Thread.sleep(FLOW_EVOLUTION_POLL_INTERVALS.get(Math.min(pollIndex, FLOW_EVOLUTION_POLL_INTERVALS.size() - 1)));
     }
 
     private FlowEvolutionStatus getFlowEvolutionStatus(final ConnectorNode connector) throws IOException {

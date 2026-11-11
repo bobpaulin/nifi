@@ -19,14 +19,19 @@ package org.apache.nifi.tests.system.connectors;
 import org.apache.nifi.components.connector.ConnectorState;
 import org.apache.nifi.flow.VersionedConnector;
 import org.apache.nifi.flow.VersionedConnectorState;
+import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.tests.system.FlowDefinitionFiles;
 import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.apache.nifi.web.api.dto.ConnectorValueReferenceDTO;
+import org.apache.nifi.web.api.dto.StateEntryDTO;
+import org.apache.nifi.web.api.entity.ComponentStateEntity;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
+import org.apache.nifi.web.api.entity.ControllerServiceEntity;
 import org.apache.nifi.web.api.entity.ParameterProviderEntity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -46,6 +51,8 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
     private static final String PROVIDER_NAME = "PropertiesParameterProvider";
     private static final String SECRET_NAME = "upgrade-secret";
     private static final String SECRET_FULLY_QUALIFIED_NAME = PROVIDER_NAME + ".Parameters." + SECRET_NAME;
+    private static final String MARKER_SERVICE = "Marker Service";
+    private static final String GENERATOR = "GenerateFlowFile";
 
     @Test
     @Timeout(360)
@@ -57,15 +64,17 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         restartKeepingIncomingVersion();
         requestStart(secretConnector.connectorId());
         getClientUtil().waitForConnectorState(secretConnector.connectorId(), ConnectorState.RUNNING);
-        assertNotPending(secretConnector.connectorId());
+        stopAndAssertNotPending(secretConnector.connectorId());
     }
 
     @Test
     @Timeout(360)
     public void testPendingUpgradeEditsThenStartsWithoutReEvolving() throws Exception {
-        final String connectorId = queueStoppedUpgrade("INHERITED_DRAIN", true, "original");
+        final String connectorId = queueAtLeastOneFlowFileAndStop(createOutgoingConnector(markerProperties("INHERITED_DRAIN", true, "original")));
         final String connectionId = findConnection(connectorId, REMOVED_CONNECTION).getId();
         final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        final long generated = generatorCount(connectorId);
+        assertQueueMatchesCount(connectorId);
         triggerUpgrade(connectorId);
 
         assertConnectorState(connectorId, ConnectorState.STOPPED);
@@ -73,25 +82,34 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
         assertPending(connectorId);
 
-        getClientUtil().configureConnector(connectorId, "Upgrade", properties("DRAIN", true, "working-edit"));
+        getClientUtil().configureConnector(connectorId, "Upgrade", markerProperties("DRAIN", true, "working-edit"));
         assertPending(connectorId);
         getNiFiInstance().stop();
-        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(firstNode(), connectorId);
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
         assertLoadedBundle(persisted, incomingBundle());
         assertManagedFlowBundle(persisted, outgoingBundle());
         assertNotNull(findProcessor(persisted.getManagedProcessGroup(), "TerminateFlowFile"));
+        final String serviceId = findMarkerServiceId(persisted);
         getNiFiInstance().start(true);
         waitForCluster();
 
-        createGates();
+        final String marker = markerValue(connectorId, serviceId);
+        assertNotNull(marker);
+        assertEquals(generated, generatorCount(connectorId));
+        assertQueueMatchesCount(connectorId);
+
+        // Releasing FlowFiles stops the generator, so its count must not move while the pre-upgrade flow drains and evolves.
+        releaseFlowFiles();
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNull(findConnection(connectorId, REMOVED_CONNECTION));
-        assertEquals("working-edit", findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());
-        assertTrue(findProcessor(connectorId, "GenerateFlowFile").getComponent().getBundle().getArtifact().contains("nifi-system-test-extensions2"));
+        assertEquals("working-edit", findProcessor(connectorId, GENERATOR).getComponent().getConfig().getComments());
+        assertTrue(findProcessor(connectorId, GENERATOR).getComponent().getBundle().getArtifact().contains("nifi-system-test-extensions2"));
+        assertEquals(generated, generatorCount(connectorId));
+        assertEquals(marker, markerValue(connectorId, serviceId));
 
         getNiFiInstance().stop();
-        final VersionedConnector evolved = FlowDefinitionFiles.readConnector(firstNode(), connectorId);
+        final VersionedConnector evolved = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
         assertManagedFlowBundle(evolved, incomingBundle());
         assertEquals(VersionedConnectorState.RUNNING, evolved.getScheduledState());
         assertEquals("working-edit", configurationProperty(evolved.getActiveFlowConfiguration(), "Comment"));
@@ -103,7 +121,7 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
 
         getClientUtil().stopConnector(connectorId);
-        getClientUtil().configureConnector(connectorId, "Upgrade", properties("DRAIN", true, "after-evolution"));
+        getClientUtil().configureConnector(connectorId, "Upgrade", markerProperties("DRAIN", true, "after-evolution"));
         getClientUtil().applyConnectorUpdate(getNifiClient().getConnectorClient().getConnector(connectorId));
         getClientUtil().waitForValidConnector(connectorId);
         assertEquals("after-evolution", findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());
@@ -127,13 +145,13 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         getClientUtil().applyConnectorUpdate(getNifiClient().getConnectorClient().getConnector(connectorId));
         getClientUtil().waitForValidConnector(connectorId);
 
-        createGates();
+        releaseFlowFiles();
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNotNull(findConnection(connectorId, REMOVED_CONNECTION));
 
         getNiFiInstance().stop();
-        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(firstNode(), connectorId);
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
         assertLoadedBundle(persisted, outgoingBundle());
         assertManagedFlowBundle(persisted, outgoingBundle());
     }
@@ -143,51 +161,154 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
     public void testRestartDuringDrainingComesBackPending() throws Exception {
         final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
         triggerUpgrade(connectorId);
-        deleteGates();
+        holdFlowFiles();
         assertTrue(getConnectorQueuedFlowFileCount(connectorId) > 0);
         requestStart(connectorId);
         waitUntilDraining(connectorId);
         final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        final long generated = generatorCount(connectorId);
         restartKeepingIncomingVersion();
         getClientUtil().cancelDrain(connectorId);
         getClientUtil().waitForConnectorStopped(connectorId);
         assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
+        assertEquals(generated, generatorCount(connectorId));
+        assertQueueMatchesCount(connectorId);
         assertNotNull(findConnection(connectorId, REMOVED_CONNECTION));
         assertPending(connectorId);
         getNiFiInstance().stop();
-        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(firstNode(), connectorId);
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
         assertLoadedBundle(persisted, incomingBundle());
         assertManagedFlowBundle(persisted, outgoingBundle());
     }
 
     @Test
     @Timeout(240)
-    public void testInvalidEvolutionResultLeavesUpgradePending() throws Exception {
+    public void testInvalidEvolutionResultLeavesUpgradePendingUntilValid() throws Exception {
         final String connectorId = queueStoppedUpgrade("NO_OP", false, null);
         final String connectionId = findConnection(connectorId, REMOVED_CONNECTION).getId();
         final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        final long generated = generatorCount(connectorId);
+        assertQueueMatchesCount(connectorId);
         changeVersion(connectorId, DRAIN_V2);
 
-        final Map<String, String> violations = new LinkedHashMap<>();
-        violations.put("NULL_FUTURE", "must return a CompletableFuture");
-        violations.put("FAILED_FUTURE", "hook failed");
-        violations.put("NULL", "Upgraded flow was not returned");
-        violations.put("THROW", "active flow failed");
-        for (final Map.Entry<String, String> violation : violations.entrySet()) {
-            deleteNodeFiles(HOOK_RESULT_FILE);
-            deleteNodeFiles(ACTIVE_FLOW_FILE);
-            if ("NULL".equals(violation.getKey()) || "THROW".equals(violation.getKey())) {
-                writeNodeFiles(ACTIVE_FLOW_FILE, violation.getKey());
-            } else {
-                writeNodeFiles(HOOK_RESULT_FILE, violation.getKey());
-            }
+        final Map<UpgradeDrainFault, String> expectedErrors = new LinkedHashMap<>();
+        expectedErrors.put(UpgradeDrainFault.HOOK_RETURNS_NULL_FUTURE, "must return a CompletableFuture");
+        expectedErrors.put(UpgradeDrainFault.HOOK_RETURNS_FAILED_FUTURE, "hook failed");
+        expectedErrors.put(UpgradeDrainFault.ACTIVE_FLOW_RETURNS_NULL, "Upgraded flow was not returned");
+        expectedErrors.put(UpgradeDrainFault.ACTIVE_FLOW_THROWS, "active flow failed");
+        for (final Map.Entry<UpgradeDrainFault, String> expectedError : expectedErrors.entrySet()) {
+            clearFaults();
+            injectFault(expectedError.getKey());
 
             requestStart(connectorId);
-            assertStoppedPending(connectorId, violation.getValue());
+            assertStoppedPending(connectorId, expectedError.getValue());
             assertEquals(connectionId, findConnection(connectorId, REMOVED_CONNECTION).getId());
             assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
+            assertEquals(generated, generatorCount(connectorId));
             assertPersistedOutgoing(connectorId);
         }
+
+        // The upgraded flow keeps the queued connection. FlowFiles are still held, so the generator keeps running and its
+        // count grows, but it must still equal the number of FlowFiles queued behind the terminator.
+        clearFaults();
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        getClientUtil().stopConnector(connectorId);
+        getClientUtil().waitForConnectorStopped(connectorId);
+
+        assertEquals(connectionId, findConnection(connectorId, REMOVED_CONNECTION).getId());
+        assertQueueMatchesCount(connectorId);
+        assertTrue(generatorCount(connectorId) >= generated);
+        stopAndAssertNotPending(connectorId);
+    }
+
+    @Test
+    @Timeout(240)
+    public void testQueueAndStateSurviveTroubleshootingRoundTrip() throws Exception {
+        final String connectorId = queueAtLeastOneFlowFileAndStop(createOutgoingConnector(markerProperties("NO_OP", false, null)));
+        final String connectionId = findConnection(connectorId, REMOVED_CONNECTION).getId();
+        final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        final long generated = generatorCount(connectorId);
+        assertQueueMatchesCount(connectorId);
+
+        getClientUtil().enterTroubleshooting(connectorId);
+        assertConnectorState(connectorId, ConnectorState.TROUBLESHOOTING);
+        final String serviceId = findMarkerServiceId(connectorId);
+        final String marker = markerValue(connectorId, serviceId);
+        assertNotNull(marker);
+        assertQueueAndCountUnchanged(connectorId, connectionId, queued, generated);
+
+        restartKeepingIncomingVersion();
+        assertConnectorState(connectorId, ConnectorState.TROUBLESHOOTING);
+        assertQueueAndCountUnchanged(connectorId, connectionId, queued, generated);
+        assertEquals(marker, markerValue(connectorId, serviceId));
+
+        // Ending Troubleshooting requires every Controller Service in the managed flow to be disabled.
+        final String managedGroupId = getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getManagedProcessGroupId();
+        getClientUtil().disableControllerServices(managedGroupId, true);
+        getClientUtil().endTroubleshooting(connectorId);
+        assertConnectorState(connectorId, ConnectorState.STOPPED);
+        assertQueueAndCountUnchanged(connectorId, connectionId, queued, generated);
+        assertEquals(marker, markerValue(connectorId, serviceId));
+    }
+
+    private Map<String, String> markerProperties(final String mode, final boolean removeConnection, final String comment) {
+        final Map<String, String> properties = properties(mode, removeConnection, comment);
+        properties.put(MARKER_SERVICE, "true");
+        return properties;
+    }
+
+    private void assertQueueAndCountUnchanged(final String connectorId, final String connectionId, final int queued, final long generated)
+            throws NiFiClientException, IOException {
+        assertEquals(connectionId, findConnection(connectorId, REMOVED_CONNECTION).getId());
+        assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
+        assertEquals(generated, generatorCount(connectorId));
+    }
+
+    /**
+     * While FlowFiles are held, the terminator keeps every generated FlowFile, so the generator's stored count equals the
+     * number of queued FlowFiles. Lost FlowFiles make the queue smaller; cleared state makes the count smaller.
+     */
+    private void assertQueueMatchesCount(final String connectorId) throws NiFiClientException, IOException {
+        assertEquals(getConnectionQueuedCount(connectorId, REMOVED_CONNECTION), generatorCount(connectorId));
+    }
+
+    private long generatorCount(final String connectorId) throws NiFiClientException, IOException {
+        final String generatorId = findProcessor(connectorId, GENERATOR).getId();
+        final String count = localStateValue(getNifiClient().getConnectorClient().getProcessorState(connectorId, generatorId), "count");
+        return count == null ? 0L : Long.parseLong(count);
+    }
+
+    private String markerValue(final String connectorId, final String serviceId) throws NiFiClientException, IOException {
+        return localStateValue(getNifiClient().getConnectorClient().getControllerServiceState(connectorId, serviceId), "marker");
+    }
+
+    private static String localStateValue(final ComponentStateEntity stateEntity, final String key) {
+        for (final StateEntryDTO entry : stateEntity.getComponentState().getLocalState().getState()) {
+            if (key.equals(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private String findMarkerServiceId(final String connectorId) throws NiFiClientException, IOException {
+        final String managedGroupId = getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getManagedProcessGroupId();
+        for (final ControllerServiceEntity service : getNifiClient().getFlowClient().getControllerServices(managedGroupId).getControllerServices()) {
+            if (MARKER_SERVICE.equals(service.getComponent().getName())) {
+                return service.getId();
+            }
+        }
+        throw new AssertionError("Managed flow of " + connectorId + " has no " + MARKER_SERVICE);
+    }
+
+    private static String findMarkerServiceId(final VersionedConnector connector) {
+        for (final VersionedControllerService service : connector.getManagedProcessGroup().getControllerServices()) {
+            if (MARKER_SERVICE.equals(service.getName())) {
+                return service.getInstanceIdentifier();
+            }
+        }
+        throw new AssertionError("Persisted managed flow has no " + MARKER_SERVICE);
     }
 
     @Test
@@ -195,7 +316,7 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
     public void testChangeVersionRejectedWhileDraining() throws Exception {
         final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
         changeVersion(connectorId, DRAIN_V2);
-        deleteGates();
+        holdFlowFiles();
         requestStart(connectorId);
         waitUntilDraining(connectorId);
         assertNotNull(actionReason(connectorId, "CHANGE_VERSION"));

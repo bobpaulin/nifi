@@ -25,6 +25,16 @@ import java.util.Map;
  */
 public abstract class AbstractChangeVersionDrainIT extends AbstractConnectorUpgradeDrainIT {
 
+    @Override
+    protected boolean isAllowFactoryReuse() {
+        return true;
+    }
+
+    @Override
+    protected boolean isDestroyEnvironmentAfterEachTest() {
+        return false;
+    }
+
     @BeforeEach
     public void uploadDrainVersions() throws Exception {
         uploadDrainNars(DRAIN_V1, DRAIN_V2);

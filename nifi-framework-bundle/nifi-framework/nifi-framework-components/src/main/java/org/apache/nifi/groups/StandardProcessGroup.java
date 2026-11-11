@@ -4063,17 +4063,7 @@ public final class StandardProcessGroup implements ProcessGroup {
         // with encryption enabled so the comparison between "current" and "proposed" sensitive values operates on values that are
         // decrypted the same way on both sides; otherwise every sensitive property appears to differ and the value written back to
         // the live component is the encrypted payload rather than the plaintext (or parameter reference) originally captured.
-        final FlowMappingOptions flowMappingOptions = new FlowMappingOptions.Builder()
-            .mapSensitiveConfiguration(true)
-            .mapPropertyDescriptors(false)
-            .stateLookup(stateLookup)
-            .componentIdLookup(ComponentIdLookup.VERSIONED_OR_GENERATE)
-            .mapInstanceIdentifiers(true)
-            .mapControllerServiceReferencesToVersionedId(false)
-            .mapFlowRegistryClientId(true)
-            .mapAssetReferences(true)
-            .propertyEncryptionProvider(propertyEncryptionProvider)
-            .build();
+        final FlowMappingOptions flowMappingOptions = FlowMappingOptions.forPersistedFlow(propertyEncryptionProvider, stateLookup);
 
         synchronizeFlow(proposedSnapshot, synchronizationOptions, flowMappingOptions);
     }
