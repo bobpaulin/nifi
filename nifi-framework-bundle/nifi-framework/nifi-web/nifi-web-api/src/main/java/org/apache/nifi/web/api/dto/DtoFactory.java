@@ -5435,7 +5435,7 @@ public final class DtoFactory {
 
         dto.setBundle(createBundleDto(bundleCoordinate));
         dto.setState(connector.getCurrentState().name());
-        final FlowEvolutionStatus flowEvolutionStatus = connector.getFlowEvolutionStatus();
+        final FlowEvolutionStatus flowEvolutionStatus = connector.getReportedFlowEvolutionStatus();
         dto.setFlowEvolutionStatus(flowEvolutionStatus == null ? FlowEvolutionStatus.INACTIVE.name() : flowEvolutionStatus.name());
 
         final FrameworkFlowContext activeFlowContext = connector.getActiveFlowContext();

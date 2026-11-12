@@ -16,9 +16,16 @@
  */
 package org.apache.nifi.tests.system.connectors;
 
+import org.apache.nifi.components.connector.ConnectorState;
+import org.apache.nifi.components.connector.FlowEvolutionStatus;
+import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.junit.jupiter.api.BeforeEach;
 
+import java.io.IOException;
 import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Version-change test support.
@@ -58,5 +65,19 @@ public abstract class AbstractChangeVersionDrainIT extends AbstractConnectorUpgr
     @Override
     protected ExpectedBundle incomingBundle() {
         return new ExpectedBundle(DRAIN_BUNDLE_ARTIFACT, DRAIN_V2);
+    }
+
+    protected void assertFlowEvolutionStatus(final String connectorId, final FlowEvolutionStatus expectedStatus) throws NiFiClientException, IOException {
+        assertEquals(expectedStatus.name(), getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getFlowEvolutionStatus());
+    }
+
+    protected void assertStoppedPending(final String connectorId, final String validationError) throws Exception {
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.STOPPED);
+        assertPending(connectorId);
+        if (validationError == null) {
+            return;
+        }
+        final String errors = getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getValidationErrors().toString();
+        assertTrue(errors.contains(validationError), errors);
     }
 }

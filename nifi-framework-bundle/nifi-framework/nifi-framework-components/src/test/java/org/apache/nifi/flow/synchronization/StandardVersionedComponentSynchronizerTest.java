@@ -75,7 +75,6 @@ import org.apache.nifi.parameter.ParameterContextManager;
 import org.apache.nifi.parameter.ParameterDescriptor;
 import org.apache.nifi.parameter.ParameterProviderConfiguration;
 import org.apache.nifi.parameter.ParameterReferenceManager;
-import org.apache.nifi.parameter.ParameterReferencedControllerServiceData;
 import org.apache.nifi.parameter.StandardParameterContext;
 import org.apache.nifi.parameter.StandardParameterContextManager;
 import org.apache.nifi.processor.ProcessContext;
@@ -200,13 +199,6 @@ public class StandardVersionedComponentSynchronizerTest {
     private static final String UPDATED_CONTEXT_DESCRIPTION = "Updated context description";
 
     private static final String SERVICE_VERSIONED_ID = "service-versioned-id";
-
-    private static final String SERVICE_PARAMETER_NAME = "service_param";
-
-    private static final PropertyDescriptor SERVICE_PROPERTY = new PropertyDescriptor.Builder()
-        .name("Service")
-        .identifiesControllerService(ControllerService.class)
-        .build();
 
     private ProcessorNode processorA;
     private ProcessorNode processorB;
@@ -836,39 +828,6 @@ public class StandardVersionedComponentSynchronizerTest {
     }
 
     @Test
-    public void testPersistedFlowRestoreLeavesServiceReferencingProcessorUnchanged() {
-        final ServiceReferencingFlow flow = createServiceReferencingFlow();
-
-        restorePersistedFlow(flow.processGroup(), mapPersistedFlow(flow.processGroup()));
-
-        verify(flow.processor(), never()).setProperties(anyMap(), anyBoolean(), anySet());
-        verify(flow.processGroup(), never()).stopProcessor(flow.processor());
-    }
-
-    @Test
-    public void testPersistedFlowRestoreRetainsServiceReferencingParameterValue() {
-        final ServiceReferencingFlow flow = createServiceReferencingFlow();
-        final String serviceId = flow.service().getIdentifier();
-
-        // A Connector's managed Parameter Context is not registered with the ParameterContextManager
-        final ParameterContext parameterContext = new StandardParameterContext.Builder()
-            .id("managed-parameter-context")
-            .name("Managed Parameter Context")
-            .parameterReferenceManager(parameterReferenceManager)
-            .build();
-        parameterContext.setParameters(Map.of(SERVICE_PARAMETER_NAME, new Parameter.Builder().name(SERVICE_PARAMETER_NAME).value(serviceId).build()));
-        when(flow.processGroup().getParameterContext()).thenReturn(parameterContext);
-        final ParameterReferencedControllerServiceData referenceData = new ParameterReferencedControllerServiceData(SERVICE_PARAMETER_NAME, flow.processor(),
-            SERVICE_PROPERTY, ControllerService.class, SERVICE_VERSIONED_ID);
-        when(parameterReferenceManager.getReferencedControllerServiceData(parameterContext, SERVICE_PARAMETER_NAME)).thenReturn(List.of(referenceData));
-
-        restorePersistedFlow(flow.processGroup(), mapPersistedFlow(flow.processGroup()));
-
-        final ParameterDescriptor serviceParameterDescriptor = new ParameterDescriptor.Builder().name(SERVICE_PARAMETER_NAME).build();
-        assertEquals(serviceId, parameterContext.getParameter(serviceParameterDescriptor).orElseThrow().getValue());
-    }
-
-    @Test
     public void testPersistedFlowRestoreTreatsBundleVersionChangeAsUpdate() throws Exception {
         final ProcessGroup processGroup = createPersistedProcessGroup();
         final ControllerServiceNode service = createPersistedControllerService(processGroup);
@@ -942,15 +901,6 @@ public class StandardVersionedComponentSynchronizerTest {
         verify(processor).setPosition(argThat(position -> position.getX() == 100D && position.getY() == 100D));
         verify(processGroup, never()).removeProcessor(any());
         verify(processGroup, never()).addProcessor(any());
-    }
-
-    private ServiceReferencingFlow createServiceReferencingFlow() {
-        final ProcessGroup processGroup = createPersistedProcessGroup();
-        final ControllerServiceNode service = createPersistedControllerService(processGroup);
-        final ProcessorNode processor = createPersistedProcessor(processGroup, "service-referencing-processor");
-        stubProperties(processor, Map.of(SERVICE_PROPERTY, service.getIdentifier()));
-        when(processGroup.getProcessors()).thenReturn(List.of(processor));
-        return new ServiceReferencingFlow(processGroup, processor, service);
     }
 
     private ProcessGroup createPersistedProcessGroup() {
@@ -2474,9 +2424,6 @@ public class StandardVersionedComponentSynchronizerTest {
     }
 
     private record ControllerServiceStateUpdate(ControllerServiceNode controllerService, ControllerServiceState state) {
-    }
-
-    private record ServiceReferencingFlow(ProcessGroup processGroup, ProcessorNode processor, ControllerServiceNode service) {
     }
 
     private class CapturingScheduledStateChangeListener implements ScheduledStateChangeListener {

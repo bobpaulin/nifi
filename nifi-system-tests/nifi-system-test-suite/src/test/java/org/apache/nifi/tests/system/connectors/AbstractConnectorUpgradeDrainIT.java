@@ -35,6 +35,7 @@ import org.apache.nifi.web.api.dto.ConnectorDTO;
 import org.apache.nifi.web.api.dto.NarSummaryDTO;
 import org.apache.nifi.web.api.entity.ConnectionEntity;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
+import org.apache.nifi.web.api.entity.LabelEntity;
 import org.apache.nifi.web.api.entity.ProcessGroupFlowEntity;
 import org.apache.nifi.web.api.entity.ProcessorEntity;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,6 +46,7 @@ import java.nio.file.Files;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -58,6 +60,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMigrationIT {
 
     private static final String GATE_FILE = "upgrade-drain-gate.txt";
+    private static final String UPGRADED_FROM_LABEL_PREFIX = "Upgraded from ";
+    static final String PREPARATION_FAILED = "flow evolution preparation failed";
     static final String REMOVED_CONNECTION = "Removed Connection";
     static final String REMOVED_PROCESSOR_CHAIN = "Removed Processor Chain";
     static final String RELAY_PROCESSOR = "RelayFlowFile";
@@ -79,12 +83,15 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
      * directory, and the file contents select the behavior. Faults that share a file replace each other.
      */
     protected enum UpgradeDrainFault {
-        HOOK_RETURNS_NULL_FUTURE("upgrade-drain-hook-result.txt", "NULL_FUTURE"),
-        HOOK_RETURNS_FAILED_FUTURE("upgrade-drain-hook-result.txt", "FAILED_FUTURE"),
+        PREPARATION_RETURNS_NULL_FUTURE("upgrade-drain-preparation-result.txt", "NULL_FUTURE"),
+        PREPARATION_FAILS("upgrade-drain-preparation-result.txt", "FAILED_FUTURE"),
+        PREPARATION_UPDATES_PRE_UPGRADE_FLOW("upgrade-drain-preparation-result.txt", "UPDATE_PRE_UPGRADE_FLOW"),
         ACTIVE_FLOW_RETURNS_NULL("upgrade-drain-active-flow.txt", "NULL"),
         ACTIVE_FLOW_THROWS("upgrade-drain-active-flow.txt", "THROW"),
+        PREPARE_FAILS("upgrade-drain-prepare-fail.txt", ""),
         APPLY_FAILS("upgrade-drain-apply-fail.txt", ""),
-        APPLY_BLOCKS("upgrade-drain-apply-block.txt", "");
+        APPLY_BLOCKS("upgrade-drain-apply-block.txt", ""),
+        INVALID_AFTER_APPLY("upgrade-drain-invalid-after-apply.txt", "");
 
         private final String fileName;
         private final String contents;
@@ -132,6 +139,16 @@ public abstract class AbstractConnectorUpgradeDrainIT extends AbstractNarSwapMig
         for (final UpgradeDrainFault fault : UpgradeDrainFault.values()) {
             clearFault(fault);
         }
+    }
+
+    /**
+     * Asserts that the Connector's managed flow carries the label UpgradeDrainConnector adds once flow evolution preparation
+     * has run, naming the bundle version that the pre-upgrade flow context reported.
+     */
+    protected void assertUpgradedFrom(final String connectorId, final String version) throws NiFiClientException, IOException {
+        final Set<LabelEntity> labels = getNifiClient().getConnectorClient().getFlow(connectorId).getProcessGroupFlow().getFlow().getLabels();
+        final List<String> labelTexts = labels == null ? List.of() : labels.stream().map(label -> label.getComponent().getLabel()).toList();
+        assertEquals(List.of(UPGRADED_FROM_LABEL_PREFIX + version), labelTexts);
     }
 
     protected void injectFault(final UpgradeDrainFault fault) throws IOException {

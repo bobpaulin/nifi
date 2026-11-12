@@ -17,9 +17,11 @@
 package org.apache.nifi.connectors.tests.system;
 
 import org.apache.nifi.components.ConfigVerificationResult;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.connector.AbstractConnector;
 import org.apache.nifi.components.connector.BundleCompatibility;
 import org.apache.nifi.components.connector.ConfigurationStep;
+import org.apache.nifi.components.connector.ConnectorConfigurationContext;
 import org.apache.nifi.components.connector.ConnectorPropertyDescriptor;
 import org.apache.nifi.components.connector.ConnectorPropertyGroup;
 import org.apache.nifi.components.connector.FlowEvolutionContext;
@@ -35,6 +37,7 @@ import org.apache.nifi.flow.ScheduledState;
 import org.apache.nifi.flow.VersionedConnection;
 import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedExternalFlow;
+import org.apache.nifi.flow.VersionedLabel;
 import org.apache.nifi.flow.VersionedParameter;
 import org.apache.nifi.flow.VersionedParameterContext;
 import org.apache.nifi.flow.VersionedProcessGroup;
@@ -44,6 +47,7 @@ import org.apache.nifi.processor.util.StandardValidators;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -152,6 +156,10 @@ public class UpgradeDrainConnector extends AbstractConnector {
     private static final String TERMINATE_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainTerminate";
     private static final String SWAPPED_PROCESSOR_ID = "upgrade-drain-swapped-processor";
     private static final String MARKER_SERVICE_TYPE = "org.apache.nifi.cs.tests.system.UpgradeDrainMarkerService";
+    private static final String UPGRADED_FROM_LABEL_ID = "upgrade-drain-upgraded-from";
+
+    private volatile boolean appliedFlowInvalid;
+    private volatile String upgradedFromVersion;
 
     @Override
     protected void onStepConfigured(final String stepName, final FlowContext workingContext) {
@@ -185,6 +193,15 @@ public class UpgradeDrainConnector extends AbstractConnector {
     }
 
     @Override
+    public void prepareForUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
+        if (Files.exists(Path.of("upgrade-drain-prepare-fail.txt"))) {
+            throw new FlowUpdateException("prepare failed");
+        }
+
+        super.prepareForUpdate(workingContext, activeContext);
+    }
+
+    @Override
     public void applyUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
         if (Files.exists(Path.of("upgrade-drain-apply-fail.txt"))) {
             throw new FlowUpdateException("apply failed");
@@ -201,16 +218,35 @@ public class UpgradeDrainConnector extends AbstractConnector {
         }
 
         getInitializationContext().updateFlow(activeContext, buildFlow(workingContext), BundleCompatibility.RESOLVE_BUNDLE);
+        if (Files.exists(Path.of("upgrade-drain-invalid-after-apply.txt"))) {
+            appliedFlowInvalid = true;
+        }
+    }
+
+    @Override
+    protected Collection<ValidationResult> customValidate(final ConnectorConfigurationContext context) {
+        if (appliedFlowInvalid) {
+            return List.of(new ValidationResult.Builder().subject("Applied Flow").valid(false).explanation("the applied flow is invalid").build());
+        }
+
+        return List.of();
     }
 
     @Override
     public CompletableFuture<Void> prepareForFlowEvolution(final FlowEvolutionContext context) throws FlowUpdateException {
-        final String hookResult = readSwitch("upgrade-drain-hook-result.txt");
-        if ("NULL_FUTURE".equals(hookResult)) {
+        upgradedFromVersion = context.getPreUpgradeActiveFlowContext().getBundle().getVersion();
+
+        final String preparationResult = readSwitch("upgrade-drain-preparation-result.txt");
+        if ("NULL_FUTURE".equals(preparationResult)) {
             return null;
         }
-        if ("FAILED_FUTURE".equals(hookResult)) {
-            return CompletableFuture.failedFuture(new FlowUpdateException("hook failed"));
+        if ("FAILED_FUTURE".equals(preparationResult)) {
+            return CompletableFuture.failedFuture(new FlowUpdateException("flow evolution preparation failed"));
+        }
+        if ("UPDATE_PRE_UPGRADE_FLOW".equals(preparationResult)) {
+            final FlowContext preUpgradeContext = context.getPreUpgradeActiveFlowContext();
+            getInitializationContext().updateFlow(preUpgradeContext, buildFlow(preUpgradeContext), BundleCompatibility.RESOLVE_BUNDLE);
+            return CompletableFuture.completedFuture(null);
         }
 
         final String mode = property(context.getPreUpgradeActiveFlowContext(), EVOLUTION_MODE);
@@ -297,6 +333,8 @@ public class UpgradeDrainConnector extends AbstractConnector {
             generate.getProperties().put(MARKER_SERVICE.getName(), markerService.getIdentifier());
         }
 
+        addUpgradedFromLabel(rootGroup);
+
         final VersionedExternalFlow flow = new VersionedExternalFlow();
         flow.setFlowContents(rootGroup);
         final String upgradeSecret = property(flowContext, UPGRADE_SECRET);
@@ -321,6 +359,26 @@ public class UpgradeDrainConnector extends AbstractConnector {
         }
         final String value = flowContext.getConfigurationContext().getProperty(CONFIG_STEP, descriptor).getValue();
         return value == null ? descriptor.getDefaultValue() : value;
+    }
+
+    /**
+     * Labels a flow built after flow evolution preparation with the bundle version that the pre-upgrade flow context reported.
+     */
+    private void addUpgradedFromLabel(final VersionedProcessGroup rootGroup) {
+        final String version = upgradedFromVersion;
+        if (version == null) {
+            return;
+        }
+
+        final VersionedLabel label = new VersionedLabel();
+        label.setIdentifier(UPGRADED_FROM_LABEL_ID);
+        label.setGroupIdentifier(rootGroup.getIdentifier());
+        label.setLabel("Upgraded from " + version);
+        label.setPosition(new Position(0, 200));
+        label.setWidth(200.0);
+        label.setHeight(40.0);
+        label.setzIndex(0L);
+        rootGroup.getLabels().add(label);
     }
 
     private static String readSwitch(final String fileName) {

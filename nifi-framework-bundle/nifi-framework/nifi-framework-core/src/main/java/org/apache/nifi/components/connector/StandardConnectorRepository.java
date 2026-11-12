@@ -930,7 +930,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
         final long startNanos = System.nanoTime();
         long lastInfoLogNanos = 0L;
         while (true) {
-            if (connector.getFlowEvolutionStatus() == FlowEvolutionStatus.FAILED) {
+            if (connector.getReportedFlowEvolutionStatus() == FlowEvolutionStatus.FAILED) {
                 throw new FlowUpdateException("Flow evolution was cancelled for " + connector);
             }
 
@@ -983,7 +983,7 @@ public class StandardConnectorRepository implements ConnectorRepository {
 
     private FlowEvolutionStatus getFlowEvolutionStatus(final ConnectorNode connector) throws IOException {
         return requestReplicator == null
-                ? connector.getFlowEvolutionStatus()
+                ? connector.getReportedFlowEvolutionStatus()
                 : requestReplicator.getFlowEvolutionStatus(connector.getIdentifier());
     }
 

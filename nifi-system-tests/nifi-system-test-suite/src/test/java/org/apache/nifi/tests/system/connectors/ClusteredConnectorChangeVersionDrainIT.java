@@ -30,6 +30,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,6 +60,10 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         waitForNodeConnectorState(1, connectorId, ConnectorState.DRAINING);
         waitForNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
 
+        requestStart(connectorId);
+        assertNodeConnectorState(1, connectorId, ConnectorState.DRAINING);
+        assertNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
+
         releaseFlowFiles(1);
         waitForNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
         assertNodeWaitsAtDrainBarrier(1, connectorId);
@@ -73,6 +78,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         assertNodeConnectionRemoved(2, connectorId);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertUpgradedFrom(connectorId, DRAIN_V1);
     }
 
     @Test
@@ -125,6 +131,25 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         assertNodeStoppedPendingWithOldFlow(2, connectorId);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.FAILED);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.FAILED);
+
+        // Node 1 drained before its attempt failed at the barrier, but the upgraded flow was never applied, so a retry
+        // prepares and drains again. A preparation failure on node 1 therefore fails the retry.
+        injectFault(1, UpgradeDrainFault.PREPARATION_FAILS);
+        requestStart(connectorId);
+        waitForNodeValidationError(1, connectorId, PREPARATION_FAILED);
+        waitForNodeConnectorState(1, connectorId, ConnectorState.STOPPED);
+        waitForNodeConnectorState(2, connectorId, ConnectorState.STOPPED);
+        assertNodeStoppedPendingWithOldFlow(1, connectorId);
+        assertNodeStoppedPendingWithOldFlow(2, connectorId);
+
+        clearFault(UpgradeDrainFault.PREPARATION_FAILS);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        assertNodeRunningWithoutRemovedConnection(1, connectorId);
+        assertNodeRunningWithoutRemovedConnection(2, connectorId);
+        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertUpgradedFrom(connectorId, DRAIN_V1);
     }
 
     /**
@@ -162,7 +187,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
 
     @Test
     @Timeout(240)
-    public void testApplyFailureRetriesApplyOnFailedNodeWithoutRerunningHook() throws Exception {
+    public void testApplyFailureRetriesApplyWithoutRepeatingEvolutionPreparation() throws Exception {
         final String connectorId = queueStoppedUpgrade("NO_OP", false, "original");
         changeVersion(connectorId, DRAIN_V2);
         getClientUtil().configureConnector(connectorId, "Upgrade", properties("NO_OP", false, "edited"));
@@ -175,11 +200,16 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATE_FAILED);
         assertManagedFlowBundle(FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId), outgoingBundle());
 
+        // Node 2 already applied the upgraded flow, so the retry only applies it on node 1. Flow evolution preparation
+        // already completed on both nodes, so the retry does not run it again.
         clearFault(UpgradeDrainFault.APPLY_FAILS);
+        injectFault(2, UpgradeDrainFault.APPLY_FAILS);
+        injectFault(UpgradeDrainFault.PREPARATION_FAILS);
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
+        assertUpgradedFrom(connectorId, DRAIN_V1);
         assertEquals("edited", findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());
         stopAndAssertNotPending(connectorId);
     }
@@ -252,6 +282,22 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
                 try {
                     final ProcessGroupStatusEntity status = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getStatus(connectorId, true);
                     return status.getProcessGroupStatus().getAggregateSnapshot().getFlowFilesQueued() == 0;
+                } catch (final Exception e) {
+                    return false;
+                }
+            });
+        } finally {
+            setupClient();
+        }
+    }
+
+    private void waitForNodeValidationError(final int nodeIndex, final String connectorId, final String validationError) throws InterruptedException {
+        switchClientToNode(nodeIndex);
+        try {
+            waitFor(() -> {
+                try {
+                    final Collection<String> errors = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connectorId).getComponent().getValidationErrors();
+                    return errors != null && errors.stream().anyMatch(error -> error.contains(validationError));
                 } catch (final Exception e) {
                     return false;
                 }

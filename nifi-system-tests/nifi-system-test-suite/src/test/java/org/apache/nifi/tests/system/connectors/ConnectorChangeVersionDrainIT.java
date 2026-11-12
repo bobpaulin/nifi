@@ -17,9 +17,12 @@
 package org.apache.nifi.tests.system.connectors;
 
 import org.apache.nifi.components.connector.ConnectorState;
+import org.apache.nifi.components.connector.FlowEvolutionStatus;
 import org.apache.nifi.flow.VersionedConnector;
 import org.apache.nifi.flow.VersionedConnectorState;
+import org.apache.nifi.flow.VersionedConnectorValueReference;
 import org.apache.nifi.flow.VersionedControllerService;
+import org.apache.nifi.flow.VersionedParameter;
 import org.apache.nifi.tests.system.FlowDefinitionFiles;
 import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.apache.nifi.web.api.dto.ConnectorValueReferenceDTO;
@@ -37,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -53,6 +57,7 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
     private static final String SECRET_FULLY_QUALIFIED_NAME = PROVIDER_NAME + ".Parameters." + SECRET_NAME;
     private static final String MARKER_SERVICE = "Marker Service";
     private static final String GENERATOR = "GenerateFlowFile";
+    private static final String CANCELLED_EVOLUTION = "Flow evolution was cancelled";
 
     @Test
     @Timeout(360)
@@ -61,7 +66,11 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         changeVersion(secretConnector.connectorId(), DRAIN_V2);
         getClientUtil().updateParameterProviderProperties(secretConnector.parameterProvider(), Map.of("parameters", SECRET_NAME + "=rotated-secret"));
 
-        restartKeepingIncomingVersion();
+        getNiFiInstance().stop();
+        assertSecretPersistedAsReference(FlowDefinitionFiles.readConnector(nodeInstance(1), secretConnector.connectorId()));
+        getNiFiInstance().start(true);
+        waitForCluster();
+
         requestStart(secretConnector.connectorId());
         getClientUtil().waitForConnectorState(secretConnector.connectorId(), ConnectorState.RUNNING);
         stopAndAssertNotPending(secretConnector.connectorId());
@@ -107,6 +116,7 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         assertTrue(findProcessor(connectorId, GENERATOR).getComponent().getBundle().getArtifact().contains("nifi-system-test-extensions2"));
         assertEquals(generated, generatorCount(connectorId));
         assertEquals(marker, markerValue(connectorId, serviceId));
+        assertUpgradedFrom(connectorId, DRAIN_V1);
 
         getNiFiInstance().stop();
         final VersionedConnector evolved = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
@@ -119,6 +129,7 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         getNiFiInstance().start(true);
         waitForCluster();
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
 
         getClientUtil().stopConnector(connectorId);
         getClientUtil().configureConnector(connectorId, "Upgrade", markerProperties("DRAIN", true, "after-evolution"));
@@ -167,7 +178,13 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         waitUntilDraining(connectorId);
         final int queued = getConnectorQueuedFlowFileCount(connectorId);
         final long generated = generatorCount(connectorId);
-        restartKeepingIncomingVersion();
+
+        // An evolution in progress keeps the Connector's desired state RUNNING, so the restarted node resumes it.
+        getNiFiInstance().stop();
+        assertEquals(VersionedConnectorState.RUNNING, FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId).getScheduledState());
+        getNiFiInstance().start(true);
+        waitForCluster();
+
         getClientUtil().cancelDrain(connectorId);
         getClientUtil().waitForConnectorStopped(connectorId);
         assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
@@ -177,6 +194,30 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         assertPending(connectorId);
         getNiFiInstance().stop();
         final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
+        assertEquals(VersionedConnectorState.ENABLED, persisted.getScheduledState());
+        assertLoadedBundle(persisted, incomingBundle());
+        assertManagedFlowBundle(persisted, outgoingBundle());
+    }
+
+    @Test
+    @Timeout(240)
+    public void testUpdatingPreUpgradeFlowDuringPreparationFailsEvolution() throws Exception {
+        final String connectorId = queueStoppedUpgrade("NO_OP", false, null);
+        final String connectionId = findConnection(connectorId, REMOVED_CONNECTION).getId();
+        final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        final long generated = generatorCount(connectorId);
+        changeVersion(connectorId, DRAIN_V2);
+        injectFault(UpgradeDrainFault.PREPARATION_UPDATES_PRE_UPGRADE_FLOW);
+        requestStart(connectorId);
+
+        assertStoppedPending(connectorId, "not an instance provided by the framework");
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.FAILED);
+        assertQueueAndCountUnchanged(connectorId, connectionId, queued, generated);
+
+        // A failed evolution sets the desired state to stopped, which is persisted as ENABLED, so a restart does not retry it.
+        getNiFiInstance().stop();
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
+        assertEquals(VersionedConnectorState.ENABLED, persisted.getScheduledState());
         assertLoadedBundle(persisted, incomingBundle());
         assertManagedFlowBundle(persisted, outgoingBundle());
     }
@@ -192,8 +233,8 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         changeVersion(connectorId, DRAIN_V2);
 
         final Map<UpgradeDrainFault, String> expectedErrors = new LinkedHashMap<>();
-        expectedErrors.put(UpgradeDrainFault.HOOK_RETURNS_NULL_FUTURE, "must return a CompletableFuture");
-        expectedErrors.put(UpgradeDrainFault.HOOK_RETURNS_FAILED_FUTURE, "hook failed");
+        expectedErrors.put(UpgradeDrainFault.PREPARATION_RETURNS_NULL_FUTURE, "must return a CompletableFuture");
+        expectedErrors.put(UpgradeDrainFault.PREPARATION_FAILS, PREPARATION_FAILED);
         expectedErrors.put(UpgradeDrainFault.ACTIVE_FLOW_RETURNS_NULL, "Upgraded flow was not returned");
         expectedErrors.put(UpgradeDrainFault.ACTIVE_FLOW_THROWS, "active flow failed");
         for (final Map.Entry<UpgradeDrainFault, String> expectedError : expectedErrors.entrySet()) {
@@ -325,9 +366,191 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         assertEquals(DRAIN_V2, getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getBundle().getVersion());
 
         getClientUtil().cancelDrain(connectorId);
-        getClientUtil().waitForConnectorStopped(connectorId);
-        assertPending(connectorId);
+        assertStoppedPending(connectorId, CANCELLED_EVOLUTION);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.FAILED);
         assertNull(actionReason(connectorId, "CHANGE_VERSION"));
+    }
+
+    @Test
+    @Timeout(240)
+    public void testStopDuringEvolutionDrainFailsEvolution() throws Exception {
+        final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
+        changeVersion(connectorId, DRAIN_V2);
+        holdFlowFiles();
+        requestStart(connectorId);
+        waitUntilDraining(connectorId);
+
+        getClientUtil().stopConnector(connectorId);
+        assertStoppedPending(connectorId, CANCELLED_EVOLUTION);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.FAILED);
+        assertNotNull(findConnection(connectorId, REMOVED_CONNECTION));
+        assertPersistedOutgoing(connectorId);
+    }
+
+    @Test
+    @Timeout(240)
+    public void testRevertAfterFailedEvolutionClearsPendingUpgrade() throws Exception {
+        final String connectorId = queueStoppedUpgrade("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        injectFault(UpgradeDrainFault.PREPARATION_FAILS);
+        requestStart(connectorId);
+        assertStoppedPending(connectorId, PREPARATION_FAILED);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.FAILED);
+
+        changeVersion(connectorId, DRAIN_V1);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+        getClientUtil().waitForValidConnector(connectorId);
+        getClientUtil().applyConnectorUpdate(getNifiClient().getConnectorClient().getConnector(connectorId));
+    }
+
+    @Test
+    @Timeout(240)
+    public void testEndingTroubleshootingAfterFailedApplyCompletesUpgrade() throws Exception {
+        final String connectorId = createOutgoingConnector("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        injectFault(UpgradeDrainFault.APPLY_FAILS);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.UPDATE_FAILED);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
+
+        clearFault(UpgradeDrainFault.APPLY_FAILS);
+        getClientUtil().enterTroubleshooting(connectorId);
+        getClientUtil().endTroubleshooting(connectorId);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+        getClientUtil().applyConnectorUpdate(getNifiClient().getConnectorClient().getConnector(connectorId));
+        getClientUtil().waitForValidConnector(connectorId);
+        stopAndAssertNotPending(connectorId);
+    }
+
+    @Test
+    @Timeout(240)
+    public void testPendingUpgradeBlocksEndingTroubleshootingWithQueuedFlowFiles() throws Exception {
+        final String connectorId = queueStoppedUpgrade("NO_OP", false, null);
+        final int queued = getConnectorQueuedFlowFileCount(connectorId);
+        changeVersion(connectorId, DRAIN_V2);
+        getClientUtil().enterTroubleshooting(connectorId);
+
+        final ConnectorEntity connector = getNifiClient().getConnectorClient().getConnector(connectorId);
+        final NiFiClientException failure = assertThrows(NiFiClientException.class, () -> getNifiClient().getConnectorClient()
+            .endTroubleshooting(connectorId, connector.getRevision().getClientId(), connector.getRevision().getVersion()));
+        assertTrue(failure.getMessage().contains(queued + " FlowFiles"), failure.getMessage());
+        assertTrue(failure.getMessage().contains("upgrade is pending"), failure.getMessage());
+        assertConnectorState(connectorId, ConnectorState.TROUBLESHOOTING);
+        assertPersistedOutgoing(connectorId);
+
+        restartKeepingIncomingVersion();
+        assertConnectorState(connectorId, ConnectorState.TROUBLESHOOTING);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
+        assertEquals(queued, getConnectorQueuedFlowFileCount(connectorId));
+    }
+
+    @Test
+    @Timeout(240)
+    public void testCancelledDrainKeepsNextUpgradePending() throws Exception {
+        final String connectorId = queueStoppedUpgrade("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        getClientUtil().stopConnector(connectorId);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+
+        // The managed flow now comes from the incoming version, so returning to the outgoing version is a pending upgrade again.
+        changeVersion(connectorId, DRAIN_V1);
+        assertPending(connectorId);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
+
+        // FlowFiles are still held, so the drain cannot finish until it is cancelled.
+        getClientUtil().drainConnector(connectorId);
+        getClientUtil().waitForConnectorDraining(connectorId);
+        getClientUtil().cancelDrain(connectorId);
+        getClientUtil().waitForConnectorStopped(connectorId);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
+        assertPending(connectorId);
+    }
+
+    @Test
+    @Timeout(240)
+    public void testRetryAfterPrepareForUpdateFailure() throws Exception {
+        final String connectorId = createOutgoingConnector("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        injectFault(UpgradeDrainFault.PREPARE_FAILS);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.UPDATE_FAILED);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
+        assertPersistedOutgoing(connectorId);
+
+        // Flow evolution preparation already completed, so the retry resumes at prepareForUpdate and never reaches this fault.
+        clearFault(UpgradeDrainFault.PREPARE_FAILS);
+        injectFault(UpgradeDrainFault.PREPARATION_FAILS);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+        assertUpgradedFrom(connectorId, DRAIN_V1);
+        stopAndAssertNotPending(connectorId);
+    }
+
+    @Test
+    @Timeout(240)
+    public void testStartWithInvalidFlowAfterUpgradeApplied() throws Exception {
+        final String connectorId = createOutgoingConnector("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        injectFault(UpgradeDrainFault.INVALID_AFTER_APPLY);
+        requestStart(connectorId);
+
+        getClientUtil().waitForInvalidConnector(connectorId);
+        final String errors = getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getValidationErrors().toString();
+        assertTrue(errors.contains("the applied flow is invalid"), errors);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+
+        getNiFiInstance().stop();
+        final VersionedConnector persisted = FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId);
+        assertManagedFlowBundle(persisted, incomingBundle());
+        assertEquals(VersionedConnectorState.RUNNING, persisted.getScheduledState());
+    }
+
+    @Test
+    @Timeout(240)
+    public void testSecondUpgradeAfterCompletedUpgrade() throws Exception {
+        releaseFlowFiles();
+        final String connectorId = createOutgoingConnector("NO_OP", false, null);
+        changeVersion(connectorId, DRAIN_V2);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        assertUpgradedFrom(connectorId, DRAIN_V1);
+        getClientUtil().stopConnector(connectorId);
+        getClientUtil().waitForConnectorStopped(connectorId);
+
+        changeVersion(connectorId, DRAIN_V1);
+        assertPending(connectorId);
+        requestStart(connectorId);
+        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
+        assertFlowEvolutionStatus(connectorId, FlowEvolutionStatus.INACTIVE);
+        assertUpgradedFrom(connectorId, DRAIN_V2);
+
+        getNiFiInstance().stop();
+        assertManagedFlowBundle(FlowDefinitionFiles.readConnector(nodeInstance(1), connectorId), outgoingBundle());
+    }
+
+    private void assertSecretPersistedAsReference(final VersionedConnector connector) {
+        final VersionedParameter parameter = connector.getManagedParameterContext().getParameters().stream()
+            .filter(candidate -> UPGRADE_SECRET.equals(candidate.getName()))
+            .findFirst()
+            .orElseThrow();
+        assertTrue(parameter.isSensitive());
+        assertFalse(parameter.isProvided());
+        assertNull(parameter.getValue());
+
+        final VersionedConnectorValueReference parameterReference = connector.getManagedParameterSecretReferences().get(UPGRADE_SECRET);
+        assertNotNull(parameterReference);
+        assertEquals(SECRET_FULLY_QUALIFIED_NAME, parameterReference.getFullyQualifiedSecretName());
+
+        final VersionedConnectorValueReference propertyReference = connector.getActiveFlowConfiguration().stream()
+            .filter(step -> "Upgrade".equals(step.getName()))
+            .map(step -> step.getProperties().get(UPGRADE_SECRET))
+            .findFirst()
+            .orElseThrow();
+        assertEquals(SECRET_FULLY_QUALIFIED_NAME, propertyReference.getFullyQualifiedSecretName());
+        assertManagedFlowBundle(connector, outgoingBundle());
     }
 
     private SecretConnector createSecretConnector(final String secretValue) throws Exception {
@@ -351,16 +574,6 @@ public class ConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT 
         getClientUtil().applyConnectorUpdate(connector);
         getClientUtil().waitForValidConnector(connector.getId());
         return new SecretConnector(connector.getId(), configuredProvider);
-    }
-
-    private void assertStoppedPending(final String connectorId, final String validationError) throws Exception {
-        getClientUtil().waitForConnectorState(connectorId, ConnectorState.STOPPED);
-        assertPending(connectorId);
-        if (validationError == null) {
-            return;
-        }
-        final String errors = getNifiClient().getConnectorClient().getConnector(connectorId).getComponent().getValidationErrors().toString();
-        assertTrue(errors.contains(validationError), errors);
     }
 
     private record SecretConnector(String connectorId, ParameterProviderEntity parameterProvider) {

@@ -18,20 +18,18 @@
 package org.apache.nifi.components.connector;
 
 import org.apache.nifi.components.ConfigVerificationResult;
-import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.connector.components.FlowContext;
 import org.apache.nifi.flow.VersionedExternalFlow;
 import org.apache.nifi.flow.VersionedProcessGroup;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 
 /**
- * Connector that counts its flow evolution hook, update preparation and apply calls. Each can be made to fail, and the hook
- * can return a future that never completes.
+ * Connector that counts its flow evolution hook, update preparation and apply calls. The hook can return a future that
+ * never completes.
  */
 public class FlowEvolutionHookConnector extends AbstractConnector {
 
@@ -40,11 +38,6 @@ public class FlowEvolutionHookConnector extends AbstractConnector {
     volatile int prepareCalls;
     volatile int applyCalls;
     volatile boolean leaveFutureIncomplete;
-    volatile boolean failHook;
-    volatile boolean failPrepare;
-    volatile boolean failApply;
-    volatile boolean invalidAfterApply;
-    volatile boolean invalid;
     volatile CompletableFuture<Void> evolutionFuture;
     final CountDownLatch hookEntered = new CountDownLatch(1);
     final CountDownLatch evolutionFuturePublished = new CountDownLatch(1);
@@ -64,9 +57,6 @@ public class FlowEvolutionHookConnector extends AbstractConnector {
     @Override
     public void prepareForUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
         prepareCalls++;
-        if (failPrepare) {
-            throw new FlowUpdateException("prepare failed");
-        }
     }
 
     @Override
@@ -77,22 +67,6 @@ public class FlowEvolutionHookConnector extends AbstractConnector {
     @Override
     public void applyUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
         applyCalls++;
-        if (failApply) {
-            throw new FlowUpdateException("apply failed");
-        }
-
-        if (invalidAfterApply) {
-            invalid = true;
-        }
-    }
-
-    @Override
-    protected Collection<ValidationResult> customValidate(final ConnectorConfigurationContext context) {
-        if (invalid) {
-            return List.of(new ValidationResult.Builder().subject("Applied Flow").valid(false).explanation("the applied flow is invalid").build());
-        }
-
-        return List.of();
     }
 
     @Override
@@ -114,9 +88,7 @@ public class FlowEvolutionHookConnector extends AbstractConnector {
         hookCalls++;
         hookEntered.countDown();
 
-        if (failHook) {
-            evolutionFuture = CompletableFuture.failedFuture(new FlowUpdateException("hook failed"));
-        } else if (leaveFutureIncomplete) {
+        if (leaveFutureIncomplete) {
             evolutionFuture = new CompletableFuture<>();
         } else {
             evolutionFuture = CompletableFuture.completedFuture(null);

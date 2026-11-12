@@ -66,15 +66,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -85,7 +81,6 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -1997,23 +1992,6 @@ public class TestStandardConnectorRepository {
     }
 
     @Test
-    public void testSyncConnectorRestoresPersistedManagedFlowWithoutTroubleshooting() throws Exception {
-        final StandardConnectorRepository repository = createRepositoryWithProvider(null);
-
-        final ConnectorNode connector = createConnectorNodeWithEmptyWorkingConfig("connector-1", "Test Connector");
-        when(connector.getCurrentState()).thenReturn(ConnectorState.STOPPED);
-        repository.restoreConnector(connector);
-
-        final VersionedConnector versioned = createVersionedConnector("connector-1", "Test Connector", VersionedConnectorState.ENABLED, List.of());
-
-        final ConnectorSyncResult result = repository.syncConnector(versioned);
-
-        assertEquals(ConnectorSyncResult.Outcome.SYNCED_CONFIG_UNCHANGED, result.getOutcome());
-        verify(connector).restorePersistedManagedFlow(versioned);
-        verify(connector, never()).restoreTroubleshootingManagedFlow(any());
-    }
-
-    @Test
     public void testSyncConnectorProviderAllowWithWorkingConfig() throws Exception {
         final ConnectorConfigurationProvider provider = mock(ConnectorConfigurationProvider.class);
 
@@ -2986,24 +2964,14 @@ public class TestStandardConnectorRepository {
     }
 
     private StandardConnectorRepository createRepositoryWithShortTimeout(final ConnectorConfigurationProvider provider) {
-        return createRepositoryWithShortTimeout(provider, Duration.ofMinutes(30));
-    }
-
-    private StandardConnectorRepository createRepositoryWithShortTimeout(final ConnectorConfigurationProvider provider, final Duration flowEvolutionDrainTimeout) {
-        return createRepositoryWithShortTimeout(provider, flowEvolutionDrainTimeout, null);
-    }
-
-    private StandardConnectorRepository createRepositoryWithShortTimeout(final ConnectorConfigurationProvider provider, final Duration flowEvolutionDrainTimeout,
-            final ConnectorRequestReplicator requestReplicator) {
         final StandardConnectorRepository repository = new StandardConnectorRepository();
         final ConnectorRepositoryInitializationContext initContext = mock(ConnectorRepositoryInitializationContext.class);
         when(initContext.getFlowManager()).thenReturn(mock(FlowManager.class));
         when(initContext.getExtensionManager()).thenReturn(mock(ExtensionManager.class));
         when(initContext.getAssetManager()).thenReturn(mock(AssetManager.class));
         when(initContext.getConnectorConfigurationProvider()).thenReturn(provider);
-        when(initContext.getRequestReplicator()).thenReturn(requestReplicator);
         when(initContext.getConnectorSyncTimeout()).thenReturn(Duration.ofSeconds(5));
-        when(initContext.getConnectorFlowEvolutionTimeout()).thenReturn(flowEvolutionDrainTimeout);
+        when(initContext.getConnectorFlowEvolutionTimeout()).thenReturn(Duration.ofMinutes(30));
         repository.initialize(initContext);
         return repository;
     }
@@ -3299,25 +3267,6 @@ public class TestStandardConnectorRepository {
     }
 
     @Test
-    public void testSyncMatchingBundleAdoptsPersistedSnapshotWithoutInstallingFlow() throws Exception {
-        final StandardConnectorNode connectorNode = createRealConnectorNode("connector-1", new FlowEvolutionHookConnector());
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-        repository.restoreConnector(connectorNode);
-        final VersionedProcessGroup persisted = flowGroup("persisted-flow");
-        final Bundle matchingBundle = new Bundle("org.apache.nifi", "test-standard-connector-node", "1.0.0");
-
-        final ConnectorSyncResult result = repository.syncConnector(versionedConnector(matchingBundle, persisted));
-
-        assertNotEquals(ConnectorSyncResult.Outcome.FAILED, result.getOutcome());
-        assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals("persisted-flow", connectorNode.getAuthoritativeFlowSnapshot().flow().getName());
-        verify(connectorNode.getActiveFlowContext().getManagedProcessGroup(), never())
-                .restoreFlowPreservingIdentifiers(any(VersionedExternalFlow.class));
-        verify(connectorNode.getActiveFlowContext().getManagedProcessGroup(), never())
-                .restoreFlowPreservingIdentifiers(any(VersionedExternalFlow.class), anyBoolean());
-    }
-
-    @Test
     public void testSyncInfersMissingManagedFlowBundleAndRegistersEvolution() throws Exception {
         final StandardConnectorNode connectorNode = createRealConnectorNode("connector-1", new FlowEvolutionHookConnector());
         final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
@@ -3346,24 +3295,6 @@ public class TestStandardConnectorRepository {
         assertNotEquals(ConnectorSyncResult.Outcome.FAILED, result.getOutcome());
         assertFalse(connectorNode.isPendingFlowEvolution());
         assertEquals("1.0.0", connectorNode.getAuthoritativeFlowSnapshot().bundle().getVersion());
-    }
-
-    @Test
-    public void testSyncTroubleshootingWithBundleMismatchRestoresPendingEvolution() throws Exception {
-        final StandardConnectorNode connectorNode = createRealConnectorNode("connector-1", new FlowEvolutionHookConnector());
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-        repository.restoreConnector(connectorNode);
-        final VersionedConnector versioned = versionedConnector(
-                new Bundle("org.apache.nifi", "test-standard-connector-node", "0.9.0"), flowGroup("troubleshooting-flow"));
-        versioned.setScheduledState(VersionedConnectorState.TROUBLESHOOTING);
-
-        final ConnectorSyncResult result = repository.syncConnector(versioned);
-
-        assertNotEquals(ConnectorSyncResult.Outcome.FAILED, result.getOutcome());
-        assertEquals(ConnectorState.TROUBLESHOOTING, connectorNode.getCurrentState());
-        assertTrue(connectorNode.isPendingFlowEvolution());
-        assertEquals("troubleshooting-flow", connectorNode.getAuthoritativeFlowSnapshot().flow().getName());
-        verify(connectorNode.getActiveFlowContext().getManagedProcessGroup()).restoreFlowPreservingIdentifiers(any(VersionedExternalFlow.class));
     }
 
     @Test
@@ -3408,24 +3339,6 @@ public class TestStandardConnectorRepository {
     }
 
     @Test
-    public void testSecondStartDuringEvolutionReturnsClaimedFuture() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        connector.leaveFutureIncomplete = true;
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("second-start", connector);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-
-        final Future<Void> evolution = repository.startConnector(connectorNode, NO_OP_PERSISTENCE);
-        assertTrue(connector.evolutionFuturePublished.await(5, TimeUnit.SECONDS));
-        assertSame(evolution, repository.startConnector(connectorNode, NO_OP_PERSISTENCE));
-        assertEquals(1, connector.hookCalls);
-
-        connector.evolutionFuture.complete(null);
-        evolution.get(5, TimeUnit.SECONDS);
-        assertEquals(1, connector.hookCalls);
-        assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
-    }
-
-    @Test
     public void testPersistenceFailureAfterApplyLeavesUpdateFailedAndLaterStartRunsNewFlow() throws Exception {
         final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
         final StandardConnectorNode connectorNode = pendingEvolutionNode("persistence-failure", connector);
@@ -3434,16 +3347,10 @@ public class TestStandardConnectorRepository {
             throw new IllegalStateException("Expected persistence failure");
         };
 
-        assertFailureAfterApplyLeavesUpdateFailedAndLaterStartRunsNewFlow(connector, connectorNode, repository, persistenceContext);
-    }
-
-    private ExecutionException assertFailureAfterApplyLeavesUpdateFailedAndLaterStartRunsNewFlow(final FlowEvolutionHookConnector connector,
-            final StandardConnectorNode connectorNode, final StandardConnectorRepository repository, final ConnectorUpdateContext persistenceContext) throws Exception {
-        final ExecutionException failure = assertThrows(ExecutionException.class,
-                () -> repository.startConnector(connectorNode, persistenceContext).get(5, TimeUnit.SECONDS));
+        assertThrows(ExecutionException.class, () -> repository.startConnector(connectorNode, persistenceContext).get(5, TimeUnit.SECONDS));
         assertEquals(ConnectorState.UPDATE_FAILED, connectorNode.getCurrentState());
         assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals(FlowEvolutionStatus.INACTIVE, connectorNode.getFlowEvolutionStatus());
+        assertEquals(FlowEvolutionStatus.INACTIVE, connectorNode.getReportedFlowEvolutionStatus());
         assertEquals(1, connector.hookCalls);
         assertEquals(1, connector.prepareCalls);
         assertEquals(1, connector.applyCalls);
@@ -3453,70 +3360,6 @@ public class TestStandardConnectorRepository {
         assertEquals(1, connector.prepareCalls);
         assertEquals(1, connector.applyCalls);
         assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
-        return failure;
-    }
-
-    @Test
-    public void testApplyFailureLeavesUpdateFailedAndRetryResumesAfterHook() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        connector.failApply = true;
-        assertUpdateFailedRetryResumesAfterHook("apply-failure", connector, () -> connector.failApply = false, 1);
-        assertEquals(2, connector.applyCalls);
-    }
-
-    @Test
-    public void testPrepareFailureAfterHookLeavesUpdateFailedAndRetryResumesAfterHook() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        connector.failPrepare = true;
-        assertUpdateFailedRetryResumesAfterHook("prepare-failure", connector, () -> connector.failPrepare = false, 0);
-        assertEquals(1, connector.applyCalls);
-    }
-
-    private void assertUpdateFailedRetryResumesAfterHook(final String identifier, final FlowEvolutionHookConnector connector, final Runnable clearFailure,
-            final int expectedApplyCallsAfterFailure) throws Exception {
-        final StandardConnectorNode connectorNode = pendingEvolutionNode(identifier, connector);
-        // No peer has anything pending, so each attempt reads the cluster status once at the drain barrier and does not wait
-        final ConnectorRequestReplicator requestReplicator = mock(ConnectorRequestReplicator.class);
-        when(requestReplicator.getFlowEvolutionStatus(identifier)).thenAnswer(invocation ->
-                FlowEvolutionStatus.merge(List.of(connectorNode.getFlowEvolutionStatus(), FlowEvolutionStatus.INACTIVE)));
-        when(requestReplicator.getState(identifier)).thenAnswer(invocation -> connectorNode.getCurrentState());
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofMinutes(30), requestReplicator);
-        final List<ConnectorState> savedStates = new CopyOnWriteArrayList<>();
-
-        final Future<Void> evolution = repository.startConnector(connectorNode, () -> savedStates.add(connectorNode.getDesiredState()));
-        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
-        assertEquals(ConnectorState.UPDATE_FAILED, connectorNode.getCurrentState());
-        assertTrue(savedStates.isEmpty());
-        assertTrue(connectorNode.isPendingFlowEvolution());
-        assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE, connectorNode.getFlowEvolutionStatus());
-        assertEquals(1, connector.hookCalls);
-        assertEquals(1, connector.prepareCalls);
-        assertEquals(expectedApplyCallsAfterFailure, connector.applyCalls);
-
-        clearFailure.run();
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(5, TimeUnit.SECONDS);
-        verify(requestReplicator, times(2)).getFlowEvolutionStatus(identifier);
-        assertEquals(1, connector.hookCalls);
-        assertEquals(2, connector.prepareCalls);
-        assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
-        assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals(FlowEvolutionStatus.INACTIVE, connectorNode.getFlowEvolutionStatus());
-    }
-
-    @Test
-    public void testEvolvedConnectorStartFailureDoesNotStopOrSave() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        connector.invalidAfterApply = true;
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("evolved-start-failure", connector);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-        final List<ConnectorState> savedStates = new CopyOnWriteArrayList<>();
-
-        final Future<Void> evolution = repository.startConnector(connectorNode, () -> savedStates.add(connectorNode.getDesiredState()));
-        assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
-        assertEquals(List.of(ConnectorState.RUNNING), savedStates);
-        assertEquals(ConnectorState.RUNNING, connectorNode.getDesiredState());
-        assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals(1, connector.applyCalls);
     }
 
     @Test
@@ -3535,127 +3378,6 @@ public class TestStandardConnectorRepository {
         assertEquals(1, connector.prepareCalls);
         assertEquals(1, connector.applyCalls);
         assertEquals(ConnectorState.RUNNING, connectorNode.getDesiredState());
-    }
-
-    @Test
-    public void testHookFailureRerunsHookOnRetry() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        connector.failHook = true;
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("hook-failure", connector);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-        final AtomicInteger saveCalls = new AtomicInteger();
-
-        final Future<Void> failedEvolution = repository.startConnector(connectorNode, saveCalls::incrementAndGet);
-        assertThrows(ExecutionException.class, () -> failedEvolution.get(5, TimeUnit.SECONDS));
-        assertEquals(0, saveCalls.get());
-        assertEquals(FlowEvolutionStatus.FAILED, connectorNode.getFlowEvolutionStatus());
-        assertEquals(1, connector.hookCalls);
-        assertEquals(0, connector.prepareCalls);
-        assertEquals(0, connector.applyCalls);
-
-        connector.failHook = false;
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(5, TimeUnit.SECONDS);
-        assertEquals(2, connector.hookCalls);
-        assertEquals(1, connector.prepareCalls);
-        assertEquals(1, connector.applyCalls);
-    }
-
-    @Test
-    public void testSuccessfulEvolutionRunsHookForLaterUpgrade() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("later-upgrade", connector);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null);
-
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(5, TimeUnit.SECONDS);
-        assertEquals(1, connector.hookCalls);
-        assertEquals(FlowEvolutionStatus.INACTIVE, connectorNode.getFlowEvolutionStatus());
-        assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals("1.0.0", connectorNode.getAuthoritativeFlowSnapshot().bundle().getVersion());
-        repository.stopConnector(connectorNode).get(5, TimeUnit.SECONDS);
-
-        connectorNode.adoptAuthoritativeSnapshot(flowGroup("second-pre-upgrade"), null, Map.of(), outgoingSnapshotBundle());
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(5, TimeUnit.SECONDS);
-
-        assertEquals(2, connector.hookCalls);
-        assertEquals(2, connector.applyCalls);
-    }
-
-    @Test
-    public void testFlowEvolutionTimeoutAbortsUpdate() throws Exception {
-        final ConnectorNode connector = mock(ConnectorNode.class);
-        when(connector.getIdentifier()).thenReturn("timeout-connector");
-        when(connector.isPendingFlowEvolution()).thenReturn(true);
-        when(connector.getFlowEvolutionStatus()).thenReturn(FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
-        when(connector.evolveFlow(any())).thenReturn(new CompletableFuture<>());
-
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofMillis(200));
-        final Future<Void> evolution = repository.startConnector(connector, NO_OP_PERSISTENCE);
-
-        final ExecutionException failure = assertThrows(ExecutionException.class, () -> evolution.get(5, TimeUnit.SECONDS));
-        assertInstanceOf(FlowUpdateException.class, failure.getCause());
-        assertTrue(failure.getCause().getMessage().contains("timed out"), failure.getCause().getMessage());
-        verify(connector, times(2)).abortUpdate(any());
-    }
-
-    @Test
-    public void testClusterFailureAfterApplyLeavesUpdateFailedAndLaterStartRunsNewFlow() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("peer-update-failed", connector);
-        final ConnectorRequestReplicator requestReplicator = mock(ConnectorRequestReplicator.class);
-        when(requestReplicator.getFlowEvolutionStatus("peer-update-failed")).thenReturn(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
-        when(requestReplicator.getState("peer-update-failed")).thenReturn(ConnectorState.UPDATE_FAILED);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofMinutes(30), requestReplicator);
-
-        final ExecutionException failure = assertFailureAfterApplyLeavesUpdateFailedAndLaterStartRunsNewFlow(connector, connectorNode, repository, NO_OP_PERSISTENCE);
-        assertInstanceOf(FlowUpdateException.class, failure.getCause());
-        assertTrue(failure.getCause().getMessage().contains("UPDATE_FAILED"), failure.getCause().getMessage());
-    }
-
-    @Test
-    public void testEvolutionWaitsForLaggingPeerBeforeStarting() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("lagging-peer", connector);
-        final ConnectorRequestReplicator requestReplicator = mock(ConnectorRequestReplicator.class);
-        when(requestReplicator.getFlowEvolutionStatus("lagging-peer")).thenReturn(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
-        when(requestReplicator.getState("lagging-peer")).thenReturn(ConnectorState.DRAINING, ConnectorState.UPDATED);
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofSeconds(30), requestReplicator);
-
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(10, TimeUnit.SECONDS);
-        verify(requestReplicator, times(2)).getState("lagging-peer");
-        assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
-        assertFalse(connectorNode.isPendingFlowEvolution());
-        assertEquals(FlowEvolutionStatus.INACTIVE, connectorNode.getFlowEvolutionStatus());
-        assertEquals(1, connector.prepareCalls);
-        assertEquals(1, connector.applyCalls);
-    }
-
-    @Test
-    public void testRetryAfterPeerEvolveDrainFailureRerunsHookAndWaitsForPeers() throws Exception {
-        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
-        final StandardConnectorNode connectorNode = pendingEvolutionNode("peer-evolve-drain-failure", connector);
-        final Queue<FlowEvolutionStatus> peerStatuses = new ConcurrentLinkedQueue<>(List.of(FlowEvolutionStatus.FAILED, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING));
-        final ConnectorRequestReplicator requestReplicator = mock(ConnectorRequestReplicator.class);
-        when(requestReplicator.getFlowEvolutionStatus("peer-evolve-drain-failure")).thenAnswer(invocation -> {
-            final FlowEvolutionStatus peerStatus = peerStatuses.isEmpty() ? FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE : peerStatuses.poll();
-            return FlowEvolutionStatus.merge(List.of(connectorNode.getFlowEvolutionStatus(), peerStatus));
-        });
-        when(requestReplicator.getState("peer-evolve-drain-failure")).thenAnswer(invocation -> connectorNode.getCurrentState());
-        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofMinutes(30), requestReplicator);
-
-        final Future<Void> failedEvolution = repository.startConnector(connectorNode, NO_OP_PERSISTENCE);
-        assertThrows(ExecutionException.class, () -> failedEvolution.get(10, TimeUnit.SECONDS));
-        assertEquals(ConnectorState.STOPPED, connectorNode.getCurrentState());
-        assertTrue(connectorNode.isPendingFlowEvolution());
-        assertEquals(FlowEvolutionStatus.FAILED, connectorNode.getFlowEvolutionStatus());
-        assertEquals(1, connector.hookCalls);
-        assertEquals(0, connector.applyCalls);
-
-        repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(20, TimeUnit.SECONDS);
-        verify(requestReplicator, times(3)).getFlowEvolutionStatus("peer-evolve-drain-failure");
-        assertEquals(2, connector.hookCalls);
-        assertEquals(1, connector.applyCalls);
-        assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
-        assertFalse(connectorNode.isPendingFlowEvolution());
     }
 
     private StandardConnectorNode pendingEvolutionNode(final String identifier, final Connector connector) throws Exception {

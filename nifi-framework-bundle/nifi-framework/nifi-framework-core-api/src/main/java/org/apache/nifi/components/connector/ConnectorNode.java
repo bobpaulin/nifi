@@ -202,10 +202,11 @@ public interface ConnectorNode extends ComponentAuthorizable, VersionedComponent
     boolean isPendingFlowEvolution();
 
     /**
-     * @return local progress through the pending flow evolution; {@link FlowEvolutionStatus#EVOLVE_DRAIN_PENDING} while this
-     *         node still has an outgoing flow to drain, even before an evolution attempt begins
+     * @return the status this node reports to the cluster for the pending flow evolution; {@link FlowEvolutionStatus#FAILED} once
+     *         the evolution has failed, and {@link FlowEvolutionStatus#EVOLVE_DRAIN_PENDING} while this node still has an outgoing
+     *         flow to drain, even before an evolution attempt begins
      */
-    default FlowEvolutionStatus getFlowEvolutionStatus() {
+    default FlowEvolutionStatus getReportedFlowEvolutionStatus() {
         return FlowEvolutionStatus.INACTIVE;
     }
 

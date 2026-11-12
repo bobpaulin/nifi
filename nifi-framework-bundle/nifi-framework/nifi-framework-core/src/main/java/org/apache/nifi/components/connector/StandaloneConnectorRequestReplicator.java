@@ -30,7 +30,7 @@ public class StandaloneConnectorRequestReplicator implements ConnectorRequestRep
 
     @Override
     public FlowEvolutionStatus getFlowEvolutionStatus(final String connectorId) {
-        return getConnector(connectorId).getFlowEvolutionStatus();
+        return getConnector(connectorId).getReportedFlowEvolutionStatus();
     }
 
     @Override
