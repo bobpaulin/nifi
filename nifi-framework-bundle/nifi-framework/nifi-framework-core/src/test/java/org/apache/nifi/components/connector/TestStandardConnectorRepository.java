@@ -2964,6 +2964,10 @@ public class TestStandardConnectorRepository {
     }
 
     private StandardConnectorRepository createRepositoryWithShortTimeout(final ConnectorConfigurationProvider provider) {
+        return createRepositoryWithShortTimeout(provider, Duration.ofMinutes(30));
+    }
+
+    private StandardConnectorRepository createRepositoryWithShortTimeout(final ConnectorConfigurationProvider provider, final Duration flowEvolutionTimeout) {
         final StandardConnectorRepository repository = new StandardConnectorRepository();
         final ConnectorRepositoryInitializationContext initContext = mock(ConnectorRepositoryInitializationContext.class);
         when(initContext.getFlowManager()).thenReturn(mock(FlowManager.class));
@@ -2971,7 +2975,7 @@ public class TestStandardConnectorRepository {
         when(initContext.getAssetManager()).thenReturn(mock(AssetManager.class));
         when(initContext.getConnectorConfigurationProvider()).thenReturn(provider);
         when(initContext.getConnectorSyncTimeout()).thenReturn(Duration.ofSeconds(5));
-        when(initContext.getConnectorFlowEvolutionTimeout()).thenReturn(Duration.ofMinutes(30));
+        when(initContext.getConnectorFlowEvolutionTimeout()).thenReturn(flowEvolutionTimeout);
         repository.initialize(initContext);
         return repository;
     }
@@ -3360,6 +3364,22 @@ public class TestStandardConnectorRepository {
         assertEquals(1, connector.prepareCalls);
         assertEquals(1, connector.applyCalls);
         assertEquals(ConnectorState.RUNNING, connectorNode.getCurrentState());
+    }
+
+    @Test
+    public void testFlowEvolutionDrainTimeoutFailsEvolution() throws Exception {
+        final FlowEvolutionHookConnector connector = new FlowEvolutionHookConnector();
+        connector.leaveFutureIncomplete = true;
+        final StandardConnectorNode connectorNode = pendingEvolutionNode("drain-timeout", connector);
+        final StandardConnectorRepository repository = createRepositoryWithShortTimeout(null, Duration.ofMillis(500));
+
+        assertThrows(ExecutionException.class, () -> repository.startConnector(connectorNode, NO_OP_PERSISTENCE).get(5, TimeUnit.SECONDS));
+        assertEquals(ConnectorState.STOPPED, connectorNode.getCurrentState());
+        assertEquals(FlowEvolutionStatus.FAILED, connectorNode.getReportedFlowEvolutionStatus());
+        assertTrue(connectorNode.isPendingFlowEvolution());
+        assertEquals(0, connector.applyCalls);
+        assertTrue(connectorNode.getValidationErrors().stream()
+            .anyMatch(result -> StandardConnectorNode.FLOW_EVOLUTION_VALIDATION_SUBJECT.equals(result.getSubject()) && result.getExplanation().contains("timed out")));
     }
 
     @Test

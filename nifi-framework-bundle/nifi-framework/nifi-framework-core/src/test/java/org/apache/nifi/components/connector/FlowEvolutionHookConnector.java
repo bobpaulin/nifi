@@ -19,6 +19,7 @@ package org.apache.nifi.components.connector;
 
 import org.apache.nifi.components.ConfigVerificationResult;
 import org.apache.nifi.components.connector.components.FlowContext;
+import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.VersionedExternalFlow;
 import org.apache.nifi.flow.VersionedProcessGroup;
 
@@ -34,6 +35,7 @@ import java.util.concurrent.CountDownLatch;
 public class FlowEvolutionHookConnector extends AbstractConnector {
 
     volatile FlowEvolutionContext context;
+    volatile Bundle preUpgradeBundle;
     volatile int hookCalls;
     volatile int prepareCalls;
     volatile int applyCalls;
@@ -85,6 +87,7 @@ public class FlowEvolutionHookConnector extends AbstractConnector {
     @Override
     public CompletableFuture<Void> prepareForFlowEvolution(final FlowEvolutionContext evolutionContext) throws FlowUpdateException {
         context = evolutionContext;
+        preUpgradeBundle = evolutionContext.getPreUpgradeActiveFlowContext().getBundle();
         hookCalls++;
         hookEntered.countDown();
 

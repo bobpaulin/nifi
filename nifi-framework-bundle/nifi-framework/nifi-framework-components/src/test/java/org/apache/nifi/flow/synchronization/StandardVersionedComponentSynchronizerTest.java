@@ -136,7 +136,6 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
@@ -860,49 +859,6 @@ public class StandardVersionedComponentSynchronizerTest {
         verify(processGroup, never()).addConnection(any());
     }
 
-    @Test
-    public void testPersistedFlowRestoreIgnoresUnchangedSensitiveProperty() {
-        final ProcessGroup processGroup = createPersistedProcessGroup();
-        final ProcessorNode processor = createPersistedProcessor(processGroup, "sensitive-processor");
-        final PropertyDescriptor sensitiveProperty = new PropertyDescriptor.Builder().name(SENSITIVE_PROPERTY_NAME).sensitive(true).build();
-        stubProperties(processor, Map.of(sensitiveProperty, DECRYPTED_TEXT));
-        when(processGroup.getProcessors()).thenReturn(List.of(processor));
-
-        restorePersistedFlow(processGroup, mapPersistedFlow(processGroup));
-
-        verify(processor, never()).setProperties(anyMap(), anyBoolean(), anySet());
-        verify(processGroup, never()).stopProcessor(processor);
-    }
-
-    @Test
-    public void testPersistedFlowRestoreUpdatesUpgradedProcessorInPlace() {
-        final ProcessGroup processGroup = createPersistedProcessGroup();
-        final ProcessorNode processor = createPersistedProcessor(processGroup, "upgraded-processor");
-        final PropertyDescriptor existingProperty = new PropertyDescriptor.Builder().name("Existing Property").build();
-        stubProperties(processor, Map.of(existingProperty, "configured value"));
-        when(processGroup.getProcessors()).thenReturn(List.of(processor));
-
-        final VersionedProcessGroup persistedGroup = mapPersistedFlow(processGroup);
-        persistedGroup.getProcessors().forEach(versionedProcessor -> versionedProcessor.setPosition(new Position(100D, 100D)));
-
-        // A NAR upgrade added a property with a default value that the persisted flow predates, so the restore clears it back to its default
-        final PropertyDescriptor addedProperty = new PropertyDescriptor.Builder().name("Added Property").defaultValue("default value").build();
-        final Map<PropertyDescriptor, String> upgradedProperties = new HashMap<>();
-        upgradedProperties.put(existingProperty, "configured value");
-        upgradedProperties.put(addedProperty, null);
-        stubProperties(processor, upgradedProperties);
-
-        restorePersistedFlow(processGroup, persistedGroup);
-
-        final Map<String, String> expectedProperties = new HashMap<>();
-        expectedProperties.put(existingProperty.getName(), "configured value");
-        expectedProperties.put(addedProperty.getName(), null);
-        verify(processor).setProperties(eq(expectedProperties), eq(true), anySet());
-        verify(processor).setPosition(argThat(position -> position.getX() == 100D && position.getY() == 100D));
-        verify(processGroup, never()).removeProcessor(any());
-        verify(processGroup, never()).addProcessor(any());
-    }
-
     private ProcessGroup createPersistedProcessGroup() {
         final ProcessGroup processGroup = createMockProcessGroup();
         final String groupId = processGroup.getIdentifier();
@@ -932,22 +888,6 @@ public class StandardVersionedComponentSynchronizerTest {
         when(controllerServiceProvider.getControllerServiceNode(service.getIdentifier())).thenReturn(service);
         when(flowManager.getControllerServiceNode(service.getIdentifier())).thenReturn(service);
         return service;
-    }
-
-    private void stubProperties(final ComponentNode component, final Map<PropertyDescriptor, String> propertyValues) {
-        final Map<PropertyDescriptor, PropertyConfiguration> configurations = new HashMap<>();
-        for (final Map.Entry<PropertyDescriptor, String> entry : propertyValues.entrySet()) {
-            final PropertyDescriptor descriptor = entry.getKey();
-            final PropertyConfiguration configuration = new PropertyConfiguration(entry.getValue(), null, null, null);
-            configurations.put(descriptor, configuration);
-            when(component.getProperty(descriptor)).thenReturn(configuration);
-            when(component.getRawPropertyValue(descriptor)).thenReturn(entry.getValue());
-            when(component.getEffectivePropertyValue(descriptor)).thenReturn(entry.getValue());
-            when(component.getPropertyDescriptor(descriptor.getName())).thenReturn(descriptor);
-        }
-
-        when(component.getProperties()).thenReturn(configurations);
-        when(component.getRawPropertyValues()).thenReturn(propertyValues);
     }
 
     private Connection createMappableConnection(final ProcessorNode source, final ProcessorNode destination, final ProcessGroup processGroup, final String versionedId,

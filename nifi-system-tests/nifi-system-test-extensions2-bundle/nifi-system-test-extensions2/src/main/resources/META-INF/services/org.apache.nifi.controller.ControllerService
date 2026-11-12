@@ -14,4 +14,3 @@
 # limitations under the License.
 
 org.apache.nifi.cs.tests.system.FakeControllerService2
-org.apache.nifi.cs.tests.system.UpgradeDrainMarkerService

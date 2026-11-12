@@ -2164,6 +2164,7 @@ public class TestStandardConnectorNode {
         connectorNode.adoptAuthoritativeSnapshot(flowGroup("pre-upgrade"), null, Map.of(), outgoingSnapshotBundle());
         connectorNode.prepareFlowEvolution();
         connectorNode.evolveFlow(flowEvolutionExecutor).get(5, TimeUnit.SECONDS);
+        assertEquals(outgoingSnapshotBundle().getVersion(), connector.preUpgradeBundle.getVersion());
 
         doThrow(new IllegalStateException("Connection queue-1 has queued FlowFiles"))
                 .when(managedProcessGroup).verifyCanUpdate(any(VersionedExternalFlow.class), eq(true), eq(false));

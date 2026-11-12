@@ -22,18 +22,14 @@ import org.apache.nifi.components.connector.BundleCompatibility;
 import org.apache.nifi.components.connector.ConfigurationStep;
 import org.apache.nifi.components.connector.ConnectorPropertyDescriptor;
 import org.apache.nifi.components.connector.ConnectorPropertyGroup;
-import org.apache.nifi.components.connector.FlowEvolutionContext;
 import org.apache.nifi.components.connector.FlowUpdateException;
 import org.apache.nifi.components.connector.PropertyType;
 import org.apache.nifi.components.connector.components.FlowContext;
 import org.apache.nifi.components.connector.util.VersionedFlowUtils;
 import org.apache.nifi.flow.Bundle;
 import org.apache.nifi.flow.Position;
-import org.apache.nifi.flow.ScheduledState;
 import org.apache.nifi.flow.VersionedConnection;
-import org.apache.nifi.flow.VersionedControllerService;
 import org.apache.nifi.flow.VersionedExternalFlow;
-import org.apache.nifi.flow.VersionedLabel;
 import org.apache.nifi.flow.VersionedParameter;
 import org.apache.nifi.flow.VersionedParameterContext;
 import org.apache.nifi.flow.VersionedProcessGroup;
@@ -43,7 +39,6 @@ import org.apache.nifi.processor.util.StandardValidators;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 
 /**
  * Pre-upgrade connector. Its flow queues FlowFiles on a connection that the version 2 connector removes.
@@ -122,18 +117,6 @@ public class UpgradeDrainConnector extends AbstractConnector {
         .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
         .build();
 
-    public static final String MARKER_SERVICE_NAME = "Marker Service";
-
-    static final ConnectorPropertyDescriptor MARKER_SERVICE = new ConnectorPropertyDescriptor.Builder()
-        .name(MARKER_SERVICE_NAME)
-        .description("When true, the flow includes an enabled Controller Service that stores a marker in its local state.")
-        .required(false)
-        .defaultValue("false")
-        .allowableValues("true", "false")
-        .type(PropertyType.STRING)
-        .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
-        .build();
-
     private static final ConnectorPropertyGroup PROPERTY_GROUP = new ConnectorPropertyGroup.Builder()
         .name("Upgrade")
         .addProperty(GATE_FILE_PATH)
@@ -143,7 +126,6 @@ public class UpgradeDrainConnector extends AbstractConnector {
         .addProperty(UPGRADE_SECRET)
         .addProperty(LEGACY_NOTE)
         .addProperty(REMOVED_PROCESSOR_CHAIN)
-        .addProperty(MARKER_SERVICE)
         .build();
 
     private static final ConfigurationStep CONFIG_STEP = new ConfigurationStep.Builder()
@@ -156,10 +138,6 @@ public class UpgradeDrainConnector extends AbstractConnector {
     private static final String GENERATE_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainGenerate";
     private static final String RELAY_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainRelay";
     private static final String TERMINATE_TYPE = "org.apache.nifi.processors.tests.system.UpgradeDrainTerminate";
-    private static final String MARKER_SERVICE_TYPE = "org.apache.nifi.cs.tests.system.UpgradeDrainMarkerService";
-    private static final String UPGRADED_FROM_LABEL_ID = "upgrade-drain-upgraded-from";
-
-    private volatile String upgradedFromVersion;
 
     @Override
     protected void onStepConfigured(final String stepName, final FlowContext workingContext) {
@@ -188,12 +166,6 @@ public class UpgradeDrainConnector extends AbstractConnector {
     @Override
     public void applyUpdate(final FlowContext workingContext, final FlowContext activeContext) throws FlowUpdateException {
         getInitializationContext().updateFlow(activeContext, buildFlow(workingContext), BundleCompatibility.RESOLVE_BUNDLE);
-    }
-
-    @Override
-    public CompletableFuture<Void> prepareForFlowEvolution(final FlowEvolutionContext context) {
-        upgradedFromVersion = context.getPreUpgradeActiveFlowContext().getBundle().getVersion();
-        return CompletableFuture.completedFuture(null);
     }
 
     private VersionedExternalFlow buildFlow(final FlowContext flowContext) {
@@ -240,14 +212,6 @@ public class UpgradeDrainConnector extends AbstractConnector {
             connection.setName(REMOVED_CONNECTION_NAME);
         }
 
-        if (Boolean.parseBoolean(property(flowContext, MARKER_SERVICE))) {
-            final VersionedControllerService markerService = VersionedFlowUtils.addControllerService(rootGroup, MARKER_SERVICE_TYPE, GATE_BUNDLE, MARKER_SERVICE_NAME);
-            markerService.setScheduledState(ScheduledState.ENABLED);
-            generate.getProperties().put(MARKER_SERVICE_NAME, markerService.getIdentifier());
-        }
-
-        addUpgradedFromLabel(rootGroup);
-
         final VersionedExternalFlow flow = new VersionedExternalFlow();
         flow.setFlowContents(rootGroup);
         final String upgradeSecret = property(flowContext, UPGRADE_SECRET);
@@ -272,25 +236,5 @@ public class UpgradeDrainConnector extends AbstractConnector {
         }
         final String value = flowContext.getConfigurationContext().getProperty(CONFIG_STEP, descriptor).getValue();
         return value == null ? descriptor.getDefaultValue() : value;
-    }
-
-    /**
-     * Labels a flow built after flow evolution preparation with the bundle version that the pre-upgrade flow context reported.
-     */
-    private void addUpgradedFromLabel(final VersionedProcessGroup rootGroup) {
-        final String version = upgradedFromVersion;
-        if (version == null) {
-            return;
-        }
-
-        final VersionedLabel label = new VersionedLabel();
-        label.setIdentifier(UPGRADED_FROM_LABEL_ID);
-        label.setGroupIdentifier(rootGroup.getIdentifier());
-        label.setLabel("Upgraded from " + version);
-        label.setPosition(new Position(0, 200));
-        label.setWidth(200.0);
-        label.setHeight(40.0);
-        label.setzIndex(0L);
-        rootGroup.getLabels().add(label);
     }
 }

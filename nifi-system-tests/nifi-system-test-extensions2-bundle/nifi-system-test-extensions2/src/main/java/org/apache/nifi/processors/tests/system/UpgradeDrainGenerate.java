@@ -20,7 +20,6 @@ import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateMap;
-import org.apache.nifi.controller.ControllerService;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
@@ -66,13 +65,6 @@ public class UpgradeDrainGenerate extends AbstractProcessor {
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
-    public static final PropertyDescriptor MARKER_SERVICE = new PropertyDescriptor.Builder()
-        .name("Marker Service")
-        .description("Optional Controller Service reference. A Connector enables only referenced services when it starts.")
-        .required(false)
-        .identifiesControllerService(ControllerService.class)
-        .build();
-
     public static final Relationship SUCCESS = new Relationship.Builder()
         .name("success")
         .description("Generated FlowFiles")
@@ -80,7 +72,7 @@ public class UpgradeDrainGenerate extends AbstractProcessor {
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
-        return List.of(FILE_SIZE, GATE_FILE, SECRET_VALUE, MARKER_SERVICE);
+        return List.of(FILE_SIZE, GATE_FILE, SECRET_VALUE);
     }
 
     @Override

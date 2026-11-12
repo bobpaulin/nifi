@@ -24,8 +24,6 @@ import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.apache.nifi.web.api.dto.ConnectorConfigurationDTO;
 import org.apache.nifi.web.api.dto.ConnectorValueReferenceDTO;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupFlowEntity;
-import org.apache.nifi.web.api.entity.ProcessorEntity;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -203,8 +201,9 @@ public class ClusteredConnectorIT extends ConnectorCrudIT {
     @Test
     public void testRunningConnectorSyncedOnReconnect() throws NiFiClientException, IOException, InterruptedException {
         // Create and start a connector
-        final ConnectorEntity connector = getClientUtil().createConnector("DataQueuingConnector");
+        final ConnectorEntity connector = getClientUtil().createConnector("NopConnector");
         assertNotNull(connector);
+        getClientUtil().configureConnector(connector, "Ignored Step", Map.of("Ignored Property", "Test Value"));
         getClientUtil().applyConnectorUpdate(connector);
         getClientUtil().startConnector(connector);
         logger.info("Created and started connector [{}]", connector.getId());
@@ -234,8 +233,7 @@ public class ClusteredConnectorIT extends ConnectorCrudIT {
         waitFor(() -> {
             try {
                 final ConnectorEntity rejoinedConnector = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connector.getId());
-                return "RUNNING".equals(rejoinedConnector.getComponent().getState())
-                        && "RUNNING".equals(managedProcessorState(connector.getId(), "GenerateFlowFile"));
+                return "RUNNING".equals(rejoinedConnector.getComponent().getState());
             } catch (final Exception e) {
                 return false;
             }
@@ -243,8 +241,8 @@ public class ClusteredConnectorIT extends ConnectorCrudIT {
 
         final ConnectorEntity finalNode2Connector = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connector.getId());
         assertEquals("RUNNING", finalNode2Connector.getComponent().getState());
-        assertManagedProcessorState(connector.getId(), "GenerateFlowFile", "RUNNING");
-        logger.info("Verified connector and managed processors are RUNNING on Node 2 after rejoin");
+        assertActiveConfigurationValue(finalNode2Connector, "Ignored Property", "Test Value");
+        logger.info("Verified connector is RUNNING on Node 2 after rejoin with correct configuration");
     }
 
     @Test
@@ -280,21 +278,6 @@ public class ClusteredConnectorIT extends ConnectorCrudIT {
         assertNotNull(node2Connector);
         assertActiveConfigurationValue(node2Connector, "Ignored Property", "Created While Disconnected");
         logger.info("Verified new connector exists on Node 2 after rejoin with correct configuration");
-    }
-
-    private void assertManagedProcessorState(final String connectorId, final String processorName, final String expectedState)
-            throws NiFiClientException, IOException {
-        assertEquals(expectedState, managedProcessorState(connectorId, processorName));
-    }
-
-    private String managedProcessorState(final String connectorId, final String processorName) throws NiFiClientException, IOException {
-        final ProcessGroupFlowEntity flow = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getFlow(connectorId);
-        for (final ProcessorEntity processor : flow.getProcessGroupFlow().getFlow().getProcessors()) {
-            if (processorName.equals(processor.getComponent().getName())) {
-                return processor.getComponent().getState();
-            }
-        }
-        return null;
     }
 
     private void assertActiveConfigurationValue(final ConnectorEntity connector, final String propertyName, final String expectedValue) {

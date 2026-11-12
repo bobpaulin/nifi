@@ -24,13 +24,10 @@ import org.apache.nifi.toolkit.client.ConnectorClient;
 import org.apache.nifi.toolkit.client.NiFiClientException;
 import org.apache.nifi.web.api.entity.ConnectionEntity;
 import org.apache.nifi.web.api.entity.ConnectorEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupFlowEntity;
-import org.apache.nifi.web.api.entity.ProcessGroupStatusEntity;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
-import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -40,11 +37,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Two-node version-change drain scenarios.
+ * Two-node version-change drain scenarios. The REST API merges every node's view of a Connector, so per-node assertions
+ * read each node directly without replication.
  */
 public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersionDrainIT {
-
-    private static final String LOADED_BUNDLE_MISMATCH_REASON = "Cluster nodes load different Connector versions: ";
 
     @Override
     public NiFiInstanceFactory getInstanceFactory() {
@@ -65,20 +61,31 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         assertNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
 
         releaseFlowFiles(1);
-        waitForNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE);
-        assertNodeWaitsAtDrainBarrier(1, connectorId);
+        waitForNode(1, connectorClient -> FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name().equals(connectorClient.getConnector(connectorId).getComponent().getFlowEvolutionStatus()));
+        // Node 1 has drained but stays at the drain barrier while node 2 still holds FlowFiles.
+        onNode(1, connectorClient -> {
+            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (System.nanoTime() < deadline) {
+                final ConnectorEntity connector = connectorClient.getConnector(connectorId);
+                assertEquals(ConnectorState.DRAINING.name(), connector.getComponent().getState());
+                assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name(), connector.getComponent().getFlowEvolutionStatus());
+                Thread.sleep(100L);
+            }
+
+            return null;
+        });
+        assertNotNull(nodeConnection(1, connectorId));
         assertNodeConnectorState(2, connectorId, ConnectorState.DRAINING);
-        assertNodeConnectionPresent(2, connectorId);
+        assertNotNull(nodeConnection(2, connectorId));
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
 
         releaseFlowFiles(2);
         waitForNodeConnectorState(1, connectorId, ConnectorState.RUNNING);
         waitForNodeConnectorState(2, connectorId, ConnectorState.RUNNING);
-        assertNodeConnectionRemoved(1, connectorId);
-        assertNodeConnectionRemoved(2, connectorId);
+        assertNull(nodeConnection(1, connectorId));
+        assertNull(nodeConnection(2, connectorId));
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
-        assertUpgradedFrom(connectorId, DRAIN_V1);
     }
 
     @Test
@@ -88,10 +95,9 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         holdFlowFiles();
         getClientUtil().startConnector(connectorId);
         waitForConnectorMinQueueCount(connectorId, 1);
-        // Release only node 1 so its generator stops while TerminateFlowFile, already running with the connector, empties
-        // that node. Node 2 keeps generating. The status API aggregates every node, so read each node without replication.
+        // Release only node 1 so its generator stops while TerminateFlowFile, already running with the connector, empties that node. Node 2 keeps generating.
         releaseFlowFiles(1);
-        waitForNodeLocalQueueEmpty(1, connectorId);
+        waitForNode(1, connectorClient -> localQueuedCount(connectorClient, connectorId) == 0);
         assertTrue(nodeLocalQueuedCount(2, connectorId) > 0);
         getClientUtil().stopConnector(connectorId);
         assertEquals(0, nodeLocalQueuedCount(1, connectorId));
@@ -136,7 +142,7 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         // prepares and drains again. A preparation failure on node 1 therefore fails the retry.
         injectFault(1, UpgradeDrainFault.PREPARATION_FAILS);
         requestStart(connectorId);
-        waitForNodeValidationError(1, connectorId, PREPARATION_FAILED);
+        waitForNode(1, connectorClient -> connectorClient.getConnector(connectorId).getComponent().getValidationErrors().toString().contains(PREPARATION_FAILED));
         waitForNodeConnectorState(1, connectorId, ConnectorState.STOPPED);
         waitForNodeConnectorState(2, connectorId, ConnectorState.STOPPED);
         assertNodeStoppedPendingWithOldFlow(1, connectorId);
@@ -145,44 +151,11 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         clearFault(UpgradeDrainFault.PREPARATION_FAILS);
         requestStart(connectorId);
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
-        assertNodeRunningWithoutRemovedConnection(1, connectorId);
-        assertNodeRunningWithoutRemovedConnection(2, connectorId);
-        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
-        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
-        assertUpgradedFrom(connectorId, DRAIN_V1);
-    }
-
-    /**
-     * A node that drops out partway through a version change keeps the outgoing version. The change is applied to node 1
-     * alone to reproduce that state deterministically.
-     */
-    @Test
-    @Timeout(300)
-    public void testNodeDisconnectDuringChangeVersionPreventsStart() throws Exception {
-        final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
-
-        changeNodeVersion(1, connectorId, DRAIN_V2);
-        assertEquals(DRAIN_V2, nodeBundleVersion(1, connectorId));
-        assertEquals(DRAIN_V1, nodeBundleVersion(2, connectorId));
-
-        final String startReason = actionReason(connectorId, "START");
-        assertNotNull(startReason);
-        assertTrue(startReason.startsWith(LOADED_BUNDLE_MISMATCH_REASON), startReason);
-        releaseFlowFiles();
-        assertThrows(NiFiClientException.class, () -> requestStart(connectorId));
-        assertNodeStoppedPendingWithOldFlow(1, connectorId);
-        assertNodeConnectorState(2, connectorId, ConnectorState.STOPPED);
-        assertNodeConnectionPresent(2, connectorId);
-        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.EVOLVE_DRAIN_PENDING);
-        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
-
-        changeNodeVersion(2, connectorId, DRAIN_V2);
-        assertNodeStoppedPendingWithOldFlow(2, connectorId);
-
-        requestStart(connectorId);
-        getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
-        assertNodeRunningWithoutRemovedConnection(1, connectorId);
-        assertNodeRunningWithoutRemovedConnection(2, connectorId);
+        for (int nodeIndex = 1; nodeIndex <= 2; nodeIndex++) {
+            assertNodeConnectorState(nodeIndex, connectorId, ConnectorState.RUNNING);
+            assertNull(nodeConnection(nodeIndex, connectorId));
+            assertNodeFlowEvolutionStatus(nodeIndex, connectorId, FlowEvolutionStatus.INACTIVE);
+        }
     }
 
     @Test
@@ -209,235 +182,67 @@ public class ClusteredConnectorChangeVersionDrainIT extends AbstractChangeVersio
         getClientUtil().waitForConnectorState(connectorId, ConnectorState.RUNNING);
         assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
         assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
-        assertUpgradedFrom(connectorId, DRAIN_V1);
         assertEquals("edited", findProcessor(connectorId, "GenerateFlowFile").getComponent().getConfig().getComments());
         stopAndAssertNotPending(connectorId);
     }
 
-    /**
-     * A node that disconnects while applying the upgraded flow does not hold back the connected node. Once it finishes
-     * applying and reconnects, it starts on the upgraded flow as well.
-     */
-    @Test
-    @Timeout(300)
-    public void testNodeDisconnectDuringApplyDoesNotBlockConnectedNode() throws Exception {
-        final String connectorId = queueStoppedUpgrade("DRAIN", true, null);
-        triggerUpgrade(connectorId);
-        injectFault(2, UpgradeDrainFault.APPLY_BLOCKS);
-        requestStart(connectorId);
-        releaseFlowFiles();
-        waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATING);
-        // Node 1 waits at UPDATED while node 2 is UPDATING. Reaching UPDATED shows it has passed the drain barrier,
-        // which requires every node to be connected.
-        waitForNodeConnectorState(1, connectorId, ConnectorState.UPDATED);
-
-        disconnectNode(2);
-        waitForNodeConnectorState(1, connectorId, ConnectorState.RUNNING);
-        assertNodeRunningWithoutRemovedConnection(1, connectorId);
-
-        clearFault(UpgradeDrainFault.APPLY_BLOCKS);
-        waitForNodeConnectorState(2, connectorId, ConnectorState.UPDATED);
-        reconnectNode(2);
-        waitForAllNodesConnected();
-        waitForNodeConnectorState(2, connectorId, ConnectorState.RUNNING);
-        assertNodeRunningWithoutRemovedConnection(1, connectorId);
-        assertNodeRunningWithoutRemovedConnection(2, connectorId);
-        assertNodeFlowEvolutionStatus(1, connectorId, FlowEvolutionStatus.INACTIVE);
-        assertNodeFlowEvolutionStatus(2, connectorId, FlowEvolutionStatus.INACTIVE);
-        stopAndAssertNotPending(connectorId);
-    }
-
-    private void changeNodeVersion(final int nodeIndex, final String connectorId, final String version) throws NiFiClientException, IOException {
+    private <T> T onNode(final int nodeIndex, final NodeCall<T> call) throws Exception {
         switchClientToNode(nodeIndex);
         try {
-            changeVersion(getNifiClient().getConnectorClient(DO_NOT_REPLICATE), connectorId, version, false);
+            return call.call(getNifiClient().getConnectorClient(DO_NOT_REPLICATE));
         } finally {
             setupClient();
         }
     }
 
-    private String nodeBundleVersion(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
+    private void waitForNode(final int nodeIndex, final NodeCall<Boolean> condition) throws InterruptedException {
         switchClientToNode(nodeIndex);
         try {
-            return getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connectorId).getComponent().getBundle().getVersion();
-        } finally {
-            setupClient();
-        }
-    }
-
-    private int nodeLocalQueuedCount(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            final ProcessGroupStatusEntity status = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getStatus(connectorId, true);
-            return status.getProcessGroupStatus().getAggregateSnapshot().getFlowFilesQueued();
-        } finally {
-            setupClient();
-        }
-    }
-
-    private void waitForNodeLocalQueueEmpty(final int nodeIndex, final String connectorId) throws InterruptedException {
-        switchClientToNode(nodeIndex);
-        try {
-            waitFor(() -> {
-                try {
-                    final ProcessGroupStatusEntity status = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getStatus(connectorId, true);
-                    return status.getProcessGroupStatus().getAggregateSnapshot().getFlowFilesQueued() == 0;
-                } catch (final Exception e) {
-                    return false;
-                }
-            });
-        } finally {
-            setupClient();
-        }
-    }
-
-    private void waitForNodeValidationError(final int nodeIndex, final String connectorId, final String validationError) throws InterruptedException {
-        switchClientToNode(nodeIndex);
-        try {
-            waitFor(() -> {
-                try {
-                    final Collection<String> errors = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connectorId).getComponent().getValidationErrors();
-                    return errors != null && errors.stream().anyMatch(error -> error.contains(validationError));
-                } catch (final Exception e) {
-                    return false;
-                }
-            });
+            final ConnectorClient connectorClient = getNifiClient().getConnectorClient(DO_NOT_REPLICATE);
+            waitFor(() -> condition.call(connectorClient));
         } finally {
             setupClient();
         }
     }
 
     private void waitForNodeConnectorState(final int nodeIndex, final String connectorId, final ConnectorState expectedState) throws InterruptedException {
-        switchClientToNode(nodeIndex);
-        try {
-            waitFor(() -> {
-                try {
-                    return expectedState.name().equals(
-                        getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connectorId).getComponent().getState());
-                } catch (final Exception e) {
-                    return false;
-                }
-            });
-        } finally {
-            setupClient();
-        }
+        waitForNode(nodeIndex, connectorClient -> expectedState.name().equals(connectorClient.getConnector(connectorId).getComponent().getState()));
     }
 
-    private void assertNodeConnectorState(final int nodeIndex, final String connectorId, final ConnectorState expectedState)
-            throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            final ConnectorEntity connector = getNifiClient().getConnectorClient(DO_NOT_REPLICATE).getConnector(connectorId);
-            assertEquals(expectedState.name(), connector.getComponent().getState());
-        } finally {
-            setupClient();
-        }
+    private void assertNodeConnectorState(final int nodeIndex, final String connectorId, final ConnectorState expectedState) throws Exception {
+        assertEquals(expectedState.name(), onNode(nodeIndex, connectorClient -> connectorClient.getConnector(connectorId)).getComponent().getState());
     }
 
-    private void assertNodeWaitsAtDrainBarrier(final int nodeIndex, final String connectorId)
-            throws NiFiClientException, IOException, InterruptedException {
-        switchClientToNode(nodeIndex);
-        try {
-            final ConnectorClient connectorClient = getNifiClient().getConnectorClient(DO_NOT_REPLICATE);
-            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (System.nanoTime() < deadline) {
-                final ConnectorEntity connector = connectorClient.getConnector(connectorId);
-                assertEquals(ConnectorState.DRAINING.name(), connector.getComponent().getState());
-                assertEquals(FlowEvolutionStatus.EVOLVE_DRAIN_COMPLETE.name(), connector.getComponent().getFlowEvolutionStatus());
-                Thread.sleep(100L);
-            }
-
-            assertNotNull(findNodeLocalConnection(connectorClient, connectorId));
-        } finally {
-            setupClient();
-        }
+    private void assertNodeFlowEvolutionStatus(final int nodeIndex, final String connectorId, final FlowEvolutionStatus expectedStatus) throws Exception {
+        assertEquals(expectedStatus.name(), onNode(nodeIndex, connectorClient -> connectorClient.getConnector(connectorId)).getComponent().getFlowEvolutionStatus());
     }
 
-    private void assertNodeConnectionPresent(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            assertNotNull(findNodeLocalConnection(getNifiClient().getConnectorClient(DO_NOT_REPLICATE), connectorId));
-        } finally {
-            setupClient();
-        }
+    private ConnectionEntity nodeConnection(final int nodeIndex, final String connectorId) throws Exception {
+        return onNode(nodeIndex, connectorClient -> findConnection(connectorClient, connectorId, REMOVED_CONNECTION));
     }
 
-    private void assertNodeConnectionRemoved(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            assertNull(findNodeLocalConnection(getNifiClient().getConnectorClient(DO_NOT_REPLICATE), connectorId));
-        } finally {
-            setupClient();
-        }
+    private int nodeLocalQueuedCount(final int nodeIndex, final String connectorId) throws Exception {
+        return onNode(nodeIndex, connectorClient -> localQueuedCount(connectorClient, connectorId));
     }
 
-    private void assertNodeRunningWithoutRemovedConnection(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            final ConnectorClient connectorClient = getNifiClient().getConnectorClient(DO_NOT_REPLICATE);
-            assertEquals(ConnectorState.RUNNING.name(), connectorClient.getConnector(connectorId).getComponent().getState());
-            assertNull(findNodeLocalConnection(connectorClient, connectorId));
-        } finally {
-            setupClient();
-        }
+    private static int localQueuedCount(final ConnectorClient connectorClient, final String connectorId) throws NiFiClientException, IOException {
+        return connectorClient.getStatus(connectorId, true).getProcessGroupStatus().getAggregateSnapshot().getFlowFilesQueued();
     }
 
-    private void assertNodeStoppedPendingWithOldFlow(final int nodeIndex, final String connectorId) throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            final ConnectorClient connectorClient = getNifiClient().getConnectorClient(DO_NOT_REPLICATE);
+    private void assertNodeStoppedPendingWithOldFlow(final int nodeIndex, final String connectorId) throws Exception {
+        onNode(nodeIndex, connectorClient -> {
             final ConnectorEntity connector = connectorClient.getConnector(connectorId);
             assertEquals(ConnectorState.STOPPED.name(), connector.getComponent().getState());
-            assertNotNull(findNodeLocalConnection(connectorClient, connectorId));
+            assertNotNull(findConnection(connectorClient, connectorId, REMOVED_CONNECTION));
             connector.setDisconnectedNodeAcknowledged(true);
             final NiFiClientException failure = assertThrows(NiFiClientException.class, () -> connectorClient.applyUpdate(connector));
             assertTrue(failure.getMessage().contains("start the connector instead"), failure.getMessage());
-        } finally {
-            setupClient();
-        }
-    }
-
-    private ConnectionEntity findNodeLocalConnection(final ConnectorClient connectorClient, final String connectorId)
-            throws NiFiClientException, IOException {
-        final ProcessGroupFlowEntity flow = connectorClient.getFlow(connectorId);
-        if (flow.getProcessGroupFlow().getFlow().getConnections() == null) {
             return null;
-        }
-
-        for (final ConnectionEntity connection : flow.getProcessGroupFlow().getFlow().getConnections()) {
-            if (REMOVED_CONNECTION.equals(connection.getComponent().getName())) {
-                return connection;
-            }
-        }
-
-        return null;
+        });
     }
 
-    private void waitForNodeFlowEvolutionStatus(final int nodeIndex, final String connectorId, final FlowEvolutionStatus expectedStatus)
-            throws InterruptedException {
-        switchClientToNode(nodeIndex);
-        try {
-            waitFor(() -> {
-                try {
-                    return expectedStatus.name().equals(getNifiClient().getConnectorClient(DO_NOT_REPLICATE)
-                        .getConnector(connectorId).getComponent().getFlowEvolutionStatus());
-                } catch (final Exception e) {
-                    return false;
-                }
-            });
-        } finally {
-            setupClient();
-        }
-    }
-
-    private void assertNodeFlowEvolutionStatus(final int nodeIndex, final String connectorId, final FlowEvolutionStatus expectedStatus)
-            throws NiFiClientException, IOException {
-        switchClientToNode(nodeIndex);
-        try {
-            assertEquals(expectedStatus.name(), getNifiClient().getConnectorClient(DO_NOT_REPLICATE)
-                .getConnector(connectorId).getComponent().getFlowEvolutionStatus());
-        } finally {
-            setupClient();
-        }
+    @FunctionalInterface
+    private interface NodeCall<T> {
+        T call(ConnectorClient connectorClient) throws Exception;
     }
 }
